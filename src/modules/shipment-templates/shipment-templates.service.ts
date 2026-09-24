@@ -48,6 +48,7 @@ export class ShipmentTemplatesService {
     const [templates, total] = await Promise.all([
       this.prisma.shipmentTemplate.findMany({
         where: {
+          deletedAt: null,
           OR: [
             { ownerId },
             { isPublic: true },
@@ -59,6 +60,7 @@ export class ShipmentTemplatesService {
       }),
       this.prisma.shipmentTemplate.count({
         where: {
+          deletedAt: null,
           OR: [
             { ownerId },
             { isPublic: true },
@@ -87,12 +89,12 @@ export class ShipmentTemplatesService {
 
     const [templates, total] = await Promise.all([
       this.prisma.shipmentTemplate.findMany({
-        where: { ownerId },
+        where: { ownerId, deletedAt: null },
         skip,
         take: limit,
         orderBy: { createdAt: 'desc' },
       }),
-      this.prisma.shipmentTemplate.count({ where: { ownerId } }),
+      this.prisma.shipmentTemplate.count({ where: { ownerId, deletedAt: null } }),
     ]);
 
     return {
@@ -119,7 +121,7 @@ export class ShipmentTemplatesService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     if (!shipment) {
@@ -157,8 +159,8 @@ export class ShipmentTemplatesService {
   }
 
   async findOne(id: string) {
-    const template = await this.prisma.shipmentTemplate.findUnique({
-      where: { id },
+    const template = await this.prisma.shipmentTemplate.findFirst({
+      where: { id, deletedAt: null },
     });
 
     if (!template) {
@@ -264,8 +266,11 @@ export class ShipmentTemplatesService {
       throw new ForbiddenException('Only the template owner can delete it');
     }
 
-    await this.prisma.shipmentTemplate.delete({
+    // Soft-delete (#306): the row is kept so audit log entries referencing it
+    // still resolve; findOne/findAll/findMine exclude it from then on.
+    await this.prisma.shipmentTemplate.update({
       where: { id },
+      data: { deletedAt: new Date() },
     });
 
     return { success: true };

@@ -54,6 +54,7 @@ export class MilestoneDeadlineJob {
           status: {
             in: [MilestoneStatus.PENDING, MilestoneStatus.PROOF_SUBMITTED],
           },
+          deletedAt: null,
           overdueNotifiedAt: null,
         },
         include: {
@@ -85,6 +86,7 @@ export class MilestoneDeadlineJob {
           status: {
             in: [MilestoneStatus.PENDING, MilestoneStatus.PROOF_SUBMITTED],
           },
+          deletedAt: null,
           overdueNotifiedAt: {
             not: null,
             lt: escalationCutoff, // initial notice was sent more than 3 days ago

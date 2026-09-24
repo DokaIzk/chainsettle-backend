@@ -37,7 +37,11 @@ export class CommentsController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'List comments on a shipment (visibility-filtered). Pinned comments sort first.' })
+  @ApiOperation({
+    summary:
+      'List root comments on a shipment (visibility-filtered), each with a replyCount. Pinned comments sort first. ' +
+      'A deleted root that still has replies is returned with deleted: true and its body redacted.',
+  })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
   findAll(
@@ -47,6 +51,24 @@ export class CommentsController {
     @CurrentUser() user: any = {},
   ) {
     return this.commentsService.findAll(shipmentId, user.stellarAddress, page, limit);
+  }
+
+  /**
+   * GET /shipments/:id/comments/:commentId/replies
+   * List the direct replies to a comment, oldest first (#299).
+   */
+  @Get(':commentId/replies')
+  @ApiOperation({ summary: 'List replies to a comment (visibility-filtered), oldest first' })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  findReplies(
+    @Param('id') shipmentId: string,
+    @Param('commentId') commentId: string,
+    @Query('page') page?: number,
+    @Query('limit') limit?: number,
+    @CurrentUser() user: any = {},
+  ) {
+    return this.commentsService.findReplies(shipmentId, commentId, user.stellarAddress, page, limit);
   }
 
   /**

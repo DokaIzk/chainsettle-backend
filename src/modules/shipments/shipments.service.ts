@@ -81,8 +81,8 @@ export class ShipmentsService {
     // Pre-populate from template if provided
     let templateData: any = {};
     if (dto.templateId) {
-      const template = await this.prisma.shipmentTemplate.findUnique({
-        where: { id: dto.templateId },
+      const template = await this.prisma.shipmentTemplate.findFirst({
+        where: { id: dto.templateId, deletedAt: null },
       });
       if (!template) {
         throw new NotFoundException(`Template ${dto.templateId} not found`);
@@ -146,6 +146,9 @@ export class ShipmentsService {
     if (!token.enabled) {
       throw new BadRequestException(`Token ${tokenAddress} is disabled and cannot be used for new shipments`);
     }
+
+    // Per-token min/max shipment value (#304) — no-op for tokens without bounds.
+    this.tokenRegistry.assertValueWithinBounds(tokenAddress, totalAmountBigInt);
 
     // Multi-signature approval gate (#234). Rejects the field outright on
     // shipments below the configured value threshold rather than dropping it
@@ -355,7 +358,7 @@ export class ShipmentsService {
 
       for (const s of shipments) {
         s.milestones = await db.milestone.findMany({
-          where: { shipmentId: s.id },
+          where: { shipmentId: s.id, deletedAt: null },
           orderBy: { milestoneIndex: 'asc' },
         });
         if (callerUserId) {
@@ -377,7 +380,7 @@ export class ShipmentsService {
       shipments = await db.shipment.findMany({
         where: { ...where, createdAt: { lte: new Date(decoded.createdAt) } },
         include: {
-          milestones: { orderBy: { milestoneIndex: 'asc' } },
+          milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
           ...favoriteInclude,
         },
         orderBy: { createdAt: 'desc' },
@@ -401,7 +404,7 @@ export class ShipmentsService {
         db.shipment.findMany({
           where,
           include: {
-            milestones: { orderBy: { milestoneIndex: 'asc' } },
+            milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
             ...favoriteInclude,
           },
           orderBy: { createdAt: 'desc' },
@@ -433,7 +436,7 @@ export class ShipmentsService {
     const shipment = await db.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
         trackingUpdates: { orderBy: { createdAt: 'asc' } },
         approvals: { orderBy: { createdAt: 'asc' } },
@@ -678,7 +681,7 @@ export class ShipmentsService {
       where: { id },
       data: updateData,
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -734,7 +737,7 @@ export class ShipmentsService {
       where: { id },
       data: { tags: nextTags },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -796,7 +799,7 @@ export class ShipmentsService {
         },
       },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -845,7 +848,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -961,7 +964,7 @@ export class ShipmentsService {
         cancelledAt: new Date(),
         refundTxHash: txHash || undefined,
       },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} cancelled by buyer ${buyerAddress}`);
@@ -1050,7 +1053,7 @@ export class ShipmentsService {
   async clone(id: string, buyerAddress: string, dto: CloneShipmentDto) {
     const source = await this.prisma.shipment.findUnique({
       where: { id },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     if (!source) throw new NotFoundException(`Shipment ${id} not found`);
@@ -1122,7 +1125,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.update({
       where: { id },
       data: { archivedAt: new Date() },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} archived by buyer ${buyerAddress}`);
@@ -1151,7 +1154,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.update({
       where: { id },
       data: { archivedAt: null },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} unarchived by buyer ${buyerAddress}`);
@@ -1622,7 +1625,7 @@ export class ShipmentsService {
 
     return this.prisma.shipment.findMany({
       where,
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -1734,7 +1737,7 @@ export class ShipmentsService {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
       },

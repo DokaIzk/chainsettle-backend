@@ -1,4 +1,4 @@
-import { IsEnum, IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsEnum, IsOptional, IsString, IsUUID, MaxLength } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { CommentVisibility } from '@prisma/client';
 
@@ -17,4 +17,9 @@ export class CreateCommentDto {
   @IsOptional()
   @IsString()
   attachmentCid?: string;
+
+  @ApiPropertyOptional({ description: 'ID of the comment this is a reply to (must be on the same shipment)' })
+  @IsOptional()
+  @IsUUID()
+  parentCommentId?: string;
 }
