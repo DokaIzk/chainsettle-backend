@@ -1,199 +1,129 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { randomUUID } from 'crypto';
 import { RedisService } from '../../common/redis/redis.service';
 
-export interface SessionRecord {
-  sessionId: string;
-  userId: string;
-  issuedAt: string;   // ISO-8601
-  lastSeen: string;   // ISO-8601
-  userAgent: string;
-  ipAddress: string;
-}
-
 /**
- * Manages lightweight session records stored in Redis alongside the existing
- * JWT blocklist pattern. Each login creates one session entry; logout removes
- * it and blocks the token. Only opaque metadata is exposed — raw tokens are
- * never stored or returned.
+ * SessionService
  *
- * Redis key layout:
- *   session:<userId>:<sessionId>  → JSON SessionRecord  (TTL = JWT_EXPIRES_IN)
- *   blocklist:<jti>               → "1"                 (TTL = remaining JWT lifetime)
+ * Manages the lifecycle of JWT sessions via Redis:
+ *
+ *  • Each JWT is given a unique `jti` (JWT ID) at issuance.
+ *  • The jti is stored in a Redis set keyed by user ID so we know
+ *    every active session for a given user.
+ *  • Revoked jtis are added to a blocklist key; the JwtStrategy
+ *    rejects any token whose jti appears in the blocklist.
+ *
+ * Key schema:
+ *   chainsettle:sessions:{userId}   → Redis Set of active jtis
+ *   chainsettle:blocklist:{jti}     → "1" with TTL = remaining token lifetime
  */
 @Injectable()
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
 
-  /** Key prefix for per-user session records */
-  private readonly SESSION_PREFIX = 'session:';
-  /** Key prefix for the JWT blocklist */
-  private readonly BLOCKLIST_PREFIX = 'blocklist:';
+  readonly SESSION_SET_PREFIX = 'chainsettle:sessions:';
+  readonly BLOCKLIST_PREFIX = 'chainsettle:blocklist:';
 
-  /** Session TTL matches the JWT lifetime so entries self-expire */
-  private readonly sessionTtlSeconds: number;
+  /** JWT TTL in seconds — must match what JwtModule is configured with. */
+  private readonly jwtTtlSeconds: number;
 
   constructor(
     private readonly redis: RedisService,
     private readonly config: ConfigService,
   ) {
-    const raw = this.config.get<string>('JWT_EXPIRES_IN', '7d');
-    this.sessionTtlSeconds = this.parseExpiresIn(raw);
+    const expiresIn = this.config.get<string>('JWT_EXPIRES_IN', '7d');
+    this.jwtTtlSeconds = this.parseExpiry(expiresIn);
   }
 
-  // ----------------------------------------------------------
-  // Public API
-  // ----------------------------------------------------------
+  // ------------------------------------------------------------------
+  // Session registration (called at login)
+  // ------------------------------------------------------------------
 
   /**
-   * Create a new session record after a successful login.
-   * Returns the opaque sessionId so it can be embedded in the JWT as `jti`.
+   * Register a newly issued JWT session so it can be enumerated later.
    */
-  async createSession(
-    userId: string,
-    userAgent: string,
-    ipAddress: string,
-  ): Promise<string> {
-    const sessionId = randomUUID();
-    const now = new Date().toISOString();
-
-    const record: SessionRecord = {
-      sessionId,
-      userId,
-      issuedAt: now,
-      lastSeen: now,
-      userAgent: userAgent || 'unknown',
-      ipAddress: ipAddress || 'unknown',
-    };
-
-    await this.redis.setJson(
-      this.sessionKey(userId, sessionId),
-      record,
-      this.sessionTtlSeconds,
-    );
-
-    this.logger.debug(`Session created: ${sessionId} for user ${userId}`);
-    return sessionId;
+  async registerSession(userId: string, jti: string): Promise<void> {
+    const key = `${this.SESSION_SET_PREFIX}${userId}`;
+    await this.redis.sadd(key, jti);
+    this.logger.debug(`Session registered: jti=${jti} for userId=${userId}`);
   }
 
-  /**
-   * List all active sessions for a user, sorted newest-first.
-   */
-  async listSessions(userId: string): Promise<SessionRecord[]> {
-    const client = this.redis.getClient();
-    const pattern = `${this.SESSION_PREFIX}${userId}:*`;
-
-    const keys = await this.scanKeys(client, pattern);
-    if (keys.length === 0) return [];
-
-    const pipeline = client.pipeline();
-    for (const key of keys) pipeline.get(key);
-    const results = await pipeline.exec();
-
-    const sessions: SessionRecord[] = [];
-    for (const [err, raw] of results ?? []) {
-      if (err || !raw) continue;
-      try {
-        sessions.push(JSON.parse(raw as string) as SessionRecord);
-      } catch {
-        // skip malformed entries
-      }
-    }
-
-    return sessions.sort(
-      (a, b) => new Date(b.issuedAt).getTime() - new Date(a.issuedAt).getTime(),
-    );
-  }
+  // ------------------------------------------------------------------
+  // Revocation
+  // ------------------------------------------------------------------
 
   /**
-   * Invalidate a single session and add its jti to the blocklist so in-flight
-   * requests with that token are immediately rejected by JwtStrategy.
+   * Revoke all active sessions for a user, optionally excluding the
+   * caller's own current session.
    *
-   * @param userId     - owner of the session (for key scoping)
-   * @param sessionId  - the jti embedded in the JWT (== sessionId)
-   * @param jwtTtlMs   - remaining lifetime of the JWT in milliseconds
+   * For each revoked jti:
+   *  1. Adds it to the Redis blocklist (TTL = JWT lifetime).
+   *  2. Removes it from the user's active-session set.
+   *
+   * @returns Number of sessions actually revoked
    */
-  async invalidateSession(
+  async revokeAllSessions(
     userId: string,
-    sessionId: string,
-    jwtTtlMs: number,
-  ): Promise<void> {
-    await this.redis.del(this.sessionKey(userId, sessionId));
+    currentJti: string,
+    includeCurrent: boolean,
+  ): Promise<number> {
+    const key = `${this.SESSION_SET_PREFIX}${userId}`;
+    const allJtis = await this.redis.smembers(key);
 
-    // Block the token for its remaining lifetime (minimum 1 s to avoid a 0-TTL no-op)
-    const ttlSeconds = Math.max(1, Math.ceil(jwtTtlMs / 1000));
-    await this.redis.set(this.blocklistKey(sessionId), '1', ttlSeconds);
+    const jtisToRevoke = includeCurrent
+      ? allJtis
+      : allJtis.filter((jti) => jti !== currentJti);
 
-    this.logger.debug(`Session invalidated: ${sessionId} for user ${userId}`);
-  }
-
-  /**
-   * Revoke one active session owned by a user.
-   * Returns false if the session is already absent.
-   */
-  async revokeSession(userId: string, sessionId: string): Promise<boolean> {
-    const key = this.sessionKey(userId, sessionId);
-    const session = await this.redis.getJson<SessionRecord>(key);
-
-    if (!session) {
-      return false;
+    if (jtisToRevoke.length === 0) {
+      return 0;
     }
 
-    const ttlSeconds = await this.redis.ttl(key);
-    const remainingSeconds = ttlSeconds > 0 ? ttlSeconds : 1;
+    // Blocklist each jti and remove from the session set in parallel
+    await Promise.all(
+      jtisToRevoke.map((jti) =>
+        this.redis.set(
+          `${this.BLOCKLIST_PREFIX}${jti}`,
+          '1',
+          this.jwtTtlSeconds,
+        ),
+      ),
+    );
 
-    await this.redis.del(key);
-    await this.redis.set(this.blocklistKey(sessionId), '1', remainingSeconds);
+    await this.redis.srem(key, ...jtisToRevoke);
 
-    this.logger.debug(`Session revoked: ${sessionId} for user ${userId}`);
-    return true;
+    this.logger.log(
+      `Revoked ${jtisToRevoke.length} session(s) for userId=${userId} (includeCurrent=${includeCurrent})`,
+    );
+
+    return jtisToRevoke.length;
   }
+
+  // ------------------------------------------------------------------
+  // Blocklist check (called by JwtStrategy on every authenticated request)
+  // ------------------------------------------------------------------
 
   /**
-   * Check whether a jti is on the blocklist (called by JwtStrategy on every request).
+   * Returns true if the given jti has been revoked (is on the blocklist).
    */
-  async isBlocked(jti: string): Promise<boolean> {
-    return this.redis.exists(this.blocklistKey(jti));
+  async isRevoked(jti: string): Promise<boolean> {
+    return this.redis.exists(`${this.BLOCKLIST_PREFIX}${jti}`);
   }
 
-  // ----------------------------------------------------------
-  // Private helpers
-  // ----------------------------------------------------------
-
-  private sessionKey(userId: string, sessionId: string): string {
-    return `${this.SESSION_PREFIX}${userId}:${sessionId}`;
-  }
-
-  private blocklistKey(jti: string): string {
-    return `${this.BLOCKLIST_PREFIX}${jti}`;
-  }
-
-  /** SCAN-based key enumeration — safe for large Redis keyspaces. */
-  private async scanKeys(client: ReturnType<RedisService['getClient']>, pattern: string): Promise<string[]> {
-    const keys: string[] = [];
-    let cursor = '0';
-    do {
-      const [next, batch] = await client.scan(cursor, 'MATCH', pattern, 'COUNT', 100);
-      cursor = next;
-      keys.push(...batch);
-    } while (cursor !== '0');
-    return keys;
-  }
+  // ------------------------------------------------------------------
+  // Helpers
+  // ------------------------------------------------------------------
 
   /**
-   * Parse JWT_EXPIRES_IN strings like "7d", "24h", "3600" (seconds as string)
-   * into a numeric TTL in seconds.
+   * Parse a JWT expiry string (e.g. "7d", "24h", "3600") into seconds.
    */
-  private parseExpiresIn(value: string): number {
-    const match = value.match(/^(\d+)([smhd]?)$/);
-    if (!match) return 7 * 24 * 3600; // default 7d
-    const n = parseInt(match[1], 10);
-    switch (match[2]) {
-      case 'd': return n * 86400;
-      case 'h': return n * 3600;
-      case 'm': return n * 60;
-      default:  return n; // plain seconds
-    }
+  private parseExpiry(expiry: string): number {
+    const match = /^(\d+)([smhd]?)$/.exec(expiry);
+    if (!match) return 7 * 24 * 60 * 60; // default: 7 days
+
+    const value = parseInt(match[1], 10);
+    const unit = match[2] || 's';
+
+    const multipliers: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+    return value * (multipliers[unit] ?? 1);
   }
 }

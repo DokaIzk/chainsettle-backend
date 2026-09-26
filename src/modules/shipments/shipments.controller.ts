@@ -634,73 +634,16 @@ export class ShipmentsController {
   }
 
   /**
-   * POST /api/v1/shipments/:id/clone
-   * Copies a shipment's structure into a new ACTIVE shipment with a fresh ID and reset milestones.
-   * Restricted to the original shipment's buyerAddress.
+   * GET /api/v1/shipments/:id/refund
+   * Returns refund details for a cancelled shipment.
    */
-  @Post(':id/clone')
-  @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Clone a shipment into a new active shipment (buyer only)' })
-  @ApiResponse({ status: 201, description: 'Cloned shipment created' })
-  @ApiResponse({ status: 403, description: 'Only the original buyer can clone' })
-  @ApiResponse({ status: 404, description: 'Source shipment not found' })
-  clone(@Param('id') id: string, @Body() dto: CloneShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.clone(id, user.stellarAddress, dto);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/cancel
-   * Buyer registers the on-chain cancellation tx hash, transitioning the shipment to CANCELLED.
-   */
-  @Post(':id/cancel')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Cancel a shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment cancelled' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can cancel' })
-  @ApiResponse({ status: 409, description: 'Shipment is not ACTIVE' })
-  cancel(@Param('id') id: string, @Body() dto: CancelShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.cancel(id, user.stellarAddress, dto.txHash);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/archive
-   * Archive a completed/cancelled shipment to hide it from default listings (buyer only).
-   */
-  @Post(':id/archive')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Archive a completed/cancelled shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment archived' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can archive' })
-  @ApiResponse({ status: 409, description: 'Only COMPLETED or CANCELLED shipments can be archived' })
-  archive(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.archive(id, user.stellarAddress);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/unarchive
-   * Restore an archived shipment to the default listing (buyer only).
-   */
-  @Post(':id/unarchive')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Unarchive a shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment unarchived' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can unarchive' })
-  @ApiResponse({ status: 409, description: 'Shipment is not archived' })
-  unarchive(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.unarchive(id, user.stellarAddress);
-  }
-
-  /**
-   * GET /api/v1/shipments/:id/my-role
-   * Return the caller's participant role without exposing full shipment data.
-   * Non-participants receive { role: null } with 200 instead of 403.
-   */
-  @Get(':id/my-role')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: "Get the caller's participant role for a shipment" })
-  @ApiResponse({ status: 200, description: "Role: BUYER | SUPPLIER | LOGISTICS | ARBITER | ADMIN | null" })
-  myRole(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.getCallerRole(id, user.stellarAddress, user.role === UserRole.ADMIN);
+  @Get(':id/refund')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get refund details for a cancelled shipment' })
+  @ApiResponse({ status: 200, description: 'Refund details' })
+  @ApiResponse({ status: 404, description: 'Shipment not found or not cancelled' })
+  getRefund(@Param('id') id: string) {
+    return this.shipmentsService.getRefundDetail(id);
   }
 
   /**

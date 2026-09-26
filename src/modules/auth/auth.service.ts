@@ -1,6 +1,7 @@
 import { Injectable, UnauthorizedException, ConflictException, Logger, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { UserRole, ShipmentStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
@@ -8,10 +9,7 @@ import { RedisService } from '../../common/redis/redis.service';
 import { LoginDto } from './dto/login.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { NotificationsService } from '../notifications/notifications.service';
-import { AuditLogService } from '../audit-logs/audit-log.service';
 import { SessionService } from './session.service';
-
-
 
 /**
  * AuthService
@@ -41,9 +39,8 @@ export class AuthService {
     private readonly redis: RedisService,
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
-    private readonly auditLog: AuditLogService,
     private readonly sessions: SessionService,
-  ) { }
+  ) {}
 
   // ----------------------------------------------------------
   // STEP 1: Generate a challenge nonce for an address
@@ -105,20 +102,17 @@ export class AuthService {
       update: { updatedAt: new Date() },
     });
 
-    if (user.deactivatedAt) {
-      throw new UnauthorizedException('Account has been deactivated');
-    }
-
-    // Create a session record and use its ID as the JWT `jti` (token identifier)
-    const sessionId = await this.sessions.createSession(user.id, userAgent, ipAddress);
-
-    // Sign JWT — embed sessionId as `jti` so logout can target this exact token
+    // Sign JWT — embed a unique jti so this session can be individually revoked
+    const jti = randomUUID();
     const accessToken = this.jwt.sign({
       sub: user.id,
       stellarAddress: user.stellarAddress,
       role: user.role,
-      jti: sessionId,
+      jti,
     });
+
+    // Track this session in Redis so revoke-all can enumerate it
+    await this.sessions.registerSession(user.id, jti);
 
     this.logger.log(`User authenticated: ${stellarAddress}`);
     return { accessToken, user };

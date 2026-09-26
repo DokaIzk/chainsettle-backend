@@ -147,13 +147,9 @@ model Shipment {
   metadata         Json?           // arbitrary key-value pairs (incoterms, port, etc)
   tags             String[]        @default([]) // searchable tags
 
-  /// Co-approvals required before any milestone on this shipment may be
-  /// confirmed. Null means the default single-approver flow.
-  requiredApprovals Int?
-
-  cancelledAt      DateTime?       // set when shipment is cancelled
-  refundTxHash     String?         // on-chain tx hash of the cancel/refund transaction
-  archivedAt       DateTime?       // set when buyer archives a completed/cancelled shipment
+  // Cancellation / refund tracking
+  cancelledAt      DateTime?       // set when shipment is cancelled on-chain
+  refundTxHash     String?         // tx hash of the on-chain cancellation
 
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt

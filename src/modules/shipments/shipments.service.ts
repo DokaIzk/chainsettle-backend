@@ -859,6 +859,71 @@ export class ShipmentsService {
   }
 
   // ----------------------------------------------------------
+  // REFUND DETAIL
+  // ----------------------------------------------------------
+
+  /**
+   * Returns refund details for a cancelled shipment.
+   * Looks up the shipment_cancelled ChainEvent to extract the refunded amount.
+   */
+  async getRefundDetail(id: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (!shipment.cancelledAt) {
+      throw new NotFoundException(`Shipment ${id} has not been cancelled`);
+    }
+
+    // Look up the corresponding ChainEvent for refund amount
+    const cancelEvent = await this.prisma.chainEvent.findFirst({
+      where: {
+        shipmentId: id,
+        eventName: 'shipment_cancelled',
+      },
+      orderBy: { ledger: 'desc' },
+    });
+
+    if (!cancelEvent) {
+      throw new InternalServerErrorException(
+        `Cancellation chain event not found for shipment ${id}. The on-chain event may not have been processed yet.`,
+      );
+    }
+
+    // Extract refunded amount from the event payload.
+    // Payload is expected to be [shipmentId, refundedAmount] (matching other event shapes).
+    // If only shipmentId is present, fall back to totalAmount as the refund.
+    let refundedAmountRaw: bigint;
+    try {
+      const payload = cancelEvent.payload as any;
+      if (Array.isArray(payload) && payload.length >= 2) {
+        refundedAmountRaw = BigInt(payload[1] ?? 0);
+      } else {
+        // Fallback: full escrow amount is refunded on cancellation
+        refundedAmountRaw = shipment.totalAmount;
+      }
+    } catch {
+      this.logger.warn(
+        `Failed to parse refund amount from payload for shipment ${id}, falling back to totalAmount`,
+      );
+      refundedAmountRaw = shipment.totalAmount;
+    }
+
+    const decimals: number = shipment.tokenDecimals ?? 7;
+
+    return {
+      cancelledAt: shipment.cancelledAt.toISOString(),
+      refundTxHash: shipment.refundTxHash ?? cancelEvent.txHash,
+      refundedAmount: this.stellar.toHumanAmount(refundedAmountRaw, decimals),
+      refundedTo: shipment.buyerAddress,
+    };
+  }
+
+  // ----------------------------------------------------------
   // ARBITER ACCEPT / DECLINE
   // ----------------------------------------------------------
 

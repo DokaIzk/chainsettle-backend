@@ -96,69 +96,28 @@ export class RedisService implements OnModuleDestroy {
     return this.client.ttl(key);
   }
 
-  async getJson<T>(key: string): Promise<T | null> {
-    const raw = await this.client.get(key);
-    if (raw === null) return null;
-    try {
-      return JSON.parse(raw) as T;
-    } catch {
-      return null;
-    }
-  }
+  // ------------------------------------------------------------------
+  // Redis Set operations (used for per-user session tracking)
+  // ------------------------------------------------------------------
 
-  async setJson<T>(key: string, value: T, ttlSeconds: number): Promise<void> {
-    await this.client.setex(key, ttlSeconds, JSON.stringify(value));
+  /**
+   * Add one or more members to a Redis set.
+   */
+  async sadd(key: string, ...members: string[]): Promise<void> {
+    await this.client.sadd(key, ...members);
   }
 
   /**
-   * Delete all keys matching a prefix using SCAN (safe for large keyspaces).
+   * Return all members of a Redis set.
    */
-  async delByPrefix(prefix: string): Promise<void> {
-    let cursor = '0';
-    do {
-      const [next, keys] = await this.client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
-      cursor = next;
-      if (keys.length > 0) {
-        await this.client.del(...keys);
-      }
-    } while (cursor !== '0');
+  async smembers(key: string): Promise<string[]> {
+    return this.client.smembers(key);
   }
 
   /**
-   * Acquire a distributed lock (SET NX PX). Returns true if this caller owns the lock.
+   * Remove one or more members from a Redis set.
    */
-  async acquireLock(key: string, token: string, ttlMs: number): Promise<boolean> {
-    const result = await this.client.set(key, token, 'PX', ttlMs, 'NX');
-    return result === 'OK';
-  }
-
-  /**
-   * Renew a lock only if still owned by `token` (compare-and-expire via Lua).
-   */
-  async renewLock(key: string, token: string, ttlMs: number): Promise<boolean> {
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("pexpire", KEYS[1], ARGV[2])
-      else
-        return 0
-      end
-    `;
-    const result = await this.client.eval(script, 1, key, token, ttlMs);
-    return result === 1;
-  }
-
-  /**
-   * Release a lock only if still owned by `token` (compare-and-del via Lua).
-   */
-  async releaseLock(key: string, token: string): Promise<boolean> {
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      else
-        return 0
-      end
-    `;
-    const result = await this.client.eval(script, 1, key, token);
-    return result === 1;
+  async srem(key: string, ...members: string[]): Promise<void> {
+    await this.client.srem(key, ...members);
   }
 }

@@ -1,30 +1,14 @@
-import {
-  Controller,
-  Get,
-  Post,
-  Patch,
-  Delete,
-  Param,
-  Body,
-  Query,
-  UseGuards,
-  ForbiddenException,
-  BadRequestException,
-  HttpCode,
-  HttpStatus,
-} from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
-import { Throttle } from '@nestjs/throttler';
-import { UserRole } from '@prisma/client';
+import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
+import { SessionService } from './session.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
-import { UpdateUserRoleDto } from './dto/update-user-role.dto';
+import { RevokeAllSessionsDto } from './dto/revoke-all-sessions.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
-import { Roles } from '../../common/decorators/roles.decorator';
-import { BlockImpersonation } from '../../common/decorators/block-impersonation.decorator';
-import { PushNotificationService } from '../notifications/push-notification.service';
-import { RegisterDeviceTokenDto } from '../notifications/dto/register-device-token.dto';
+import { AuditLogService } from '../audit-logs/audit-log.service';
+import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationType } from '@prisma/client';
 
 @ApiTags('users')
 @Controller('users')
@@ -33,7 +17,9 @@ import { RegisterDeviceTokenDto } from '../notifications/dto/register-device-tok
 export class UsersController {
   constructor(
     private readonly authService: AuthService,
-    private readonly push: PushNotificationService,
+    private readonly sessionService: SessionService,
+    private readonly auditLogs: AuditLogService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   @Get('me')
@@ -83,173 +69,58 @@ export class UsersController {
     return this.authService.updateProfile(user.id, dto);
   }
 
-  @Get('me/export')
-  @Throttle({ default: { limit: 3, ttl: 60 * 60 * 1000 } })
-  @ApiOperation({
-    summary: "Export the authenticated user's personal data (GDPR/CCPA)",
-    description:
-      'Returns a complete JSON bundle of the caller\'s own profile, shipments they are party to, ' +
-      'comments, notifications, and audit log entries. Other participants on shared records are only ' +
-      'ever identified by their public Stellar address — never their name or email.',
-  })
-  @ApiResponse({ status: 200, description: 'Full data export for the authenticated user' })
-  @ApiResponse({ status: 401, description: 'Unauthorized' })
-  @ApiResponse({ status: 429, description: 'Rate limit exceeded' })
-  exportMyData(@CurrentUser('id') userId: string) {
-    return this.authService.exportUserData(userId);
-  }
-
-  @Delete('me')
-  @BlockImpersonation()
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Deactivate the authenticated user account',
-    description:
-      'Soft-deactivates the account (sets deactivatedAt). The user row and historical data remain for referential integrity. Rejected if the user has any ACTIVE shipments as buyer, supplier, logistics, or arbiter.',
-  })
-  @ApiResponse({ status: 200, description: 'Account deactivated successfully' })
-  @ApiResponse({ status: 401, description: 'Unauthorized' })
-  @ApiResponse({ status: 403, description: 'Blocked during impersonation' })
-  @ApiResponse({
-    status: 409,
-    description: 'User has active shipments that must be resolved or transferred first',
-  })
-  deactivateAccount(@CurrentUser() user: any) {
-    return this.authService.deactivateUser(user.id);
-  }
-
   /**
-   * GET /api/v1/admin/users
-   * Paginated user list with role and email verification filters.
-   * Restricted to ADMIN role.
+   * POST /users/me/sessions/revoke-all
+   *
+   * Revoke every active session for the authenticated user except the
+   * current one (unless includeCurrent: true is passed).
+   *
+   * After this call:
+   *  - Tokens from all other devices are added to the Redis blocklist
+   *    and will be rejected on their next request.
+   *  - The caller's own token continues to work (unless includeCurrent).
+   *  - An audit log entry is written.
+   *  - A SYSTEM_ALERT notification is sent.
    */
-  @Get('admin/users')
-  @Roles(UserRole.ADMIN)
-  @ApiOperation({ summary: '[Admin] List platform users with role and email verification filters' })
-  @ApiResponse({ status: 200, description: 'Paginated user list' })
-  @ApiResponse({ status: 403, description: 'Admin access required' })
-  @ApiQuery({ name: 'role', required: false, enum: UserRole })
-  @ApiQuery({ name: 'emailVerified', required: false, type: Boolean })
-  @ApiQuery({ name: 'page', required: false, type: Number })
-  @ApiQuery({ name: 'limit', required: false, type: Number })
-  @ApiQuery({ name: 'orderBy', required: false, enum: ['createdAt', 'name'] })
-  findAllUsers(
+  @Post('me/sessions/revoke-all')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Revoke all sessions except the current one (sign out of all other devices)' })
+  @ApiResponse({ status: 200, description: 'Sessions revoked — returns { revokedCount }' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  async revokeAllSessions(
     @CurrentUser() user: any,
-    @Query('role') role?: UserRole,
-    @Query('emailVerified') emailVerified?: string,
-    @Query('page') page?: string,
-    @Query('limit') limit?: string,
-    @Query('orderBy') orderBy?: 'createdAt' | 'name',
+    @Body() dto: RevokeAllSessionsDto,
+    @Req() req: any,
   ) {
-    if (user?.role !== UserRole.ADMIN) {
-      throw new ForbiddenException('Admin access required');
-    }
-    return this.authService.findAllUsers({
-      role,
-      emailVerified: emailVerified !== undefined ? emailVerified === 'true' : undefined,
-      page: page ? parseInt(page, 10) : undefined,
-      limit: limit ? parseInt(limit, 10) : undefined,
-      orderBy,
+    const currentJti: string = user.jti ?? '';
+    const includeCurrent = dto.includeCurrent ?? false;
+
+    const revokedCount = await this.sessionService.revokeAllSessions(
+      user.id,
+      currentJti,
+      includeCurrent,
+    );
+
+    // Audit log
+    await this.auditLogs.record({
+      actorId: user.id,
+      actorAddress: user.stellarAddress,
+      action: 'session.revoke_all',
+      resourceType: 'user',
+      resourceId: user.id,
+      metadata: { revokedCount, includeCurrent },
+      ipAddress: req.ip,
     });
-  }
 
-  /**
-   * POST /api/v1/users/admin/:id/deactivate
-   * Admin-only suspension, bypassing the self-service active-shipment check.
-   */
-  @Post('admin/:id/deactivate')
-  @Roles(UserRole.ADMIN)
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: '[Admin] Deactivate a user account, bypassing the active-shipment check' })
-  @ApiResponse({ status: 200, description: 'Account deactivated (or already deactivated)' })
-  @ApiResponse({ status: 400, description: 'Admins cannot deactivate their own account via this route' })
-  @ApiResponse({ status: 403, description: 'Admin access required' })
-  @ApiResponse({ status: 404, description: 'User not found' })
-  deactivateUserAsAdmin(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.authService.adminSetActive(id, false, user.id, user.stellarAddress);
-  }
+    // In-app + email notification
+    await this.notifications.notifyUser(
+      user.stellarAddress,
+      NotificationType.SYSTEM_ALERT,
+      'Security alert: sessions revoked',
+      `${revokedCount} active session(s) were signed out${includeCurrent ? ', including your current session' : ''}.`,
+      { revokedCount, includeCurrent },
+    );
 
-  /**
-   * POST /api/v1/users/admin/:id/reactivate
-   */
-  @Post('admin/:id/reactivate')
-  @Roles(UserRole.ADMIN)
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: '[Admin] Reactivate a previously deactivated user account' })
-  @ApiResponse({ status: 200, description: 'Account reactivated (or already active)' })
-  @ApiResponse({ status: 403, description: 'Admin access required' })
-  @ApiResponse({ status: 404, description: 'User not found' })
-  reactivateUserAsAdmin(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.authService.adminSetActive(id, true, user.id, user.stellarAddress);
-  }
-
-  /**
-   * GET /api/v1/users/admin/:id
-   * Registered after admin/users (list) so the literal segment isn't
-   * shadowed by this param route, and before :stellarAddress below.
-   */
-  @Get('admin/:id')
-  @Roles(UserRole.ADMIN)
-  @ApiOperation({ summary: '[Admin] Get full detail view of a single user' })
-  @ApiResponse({ status: 200, description: 'Full user record plus computed operational counts' })
-  @ApiResponse({ status: 403, description: 'Admin access required' })
-  @ApiResponse({ status: 404, description: 'User not found' })
-  getAdminUserDetail(@Param('id') id: string) {
-    return this.authService.getAdminUserDetail(id);
-  }
-
-  @Post('me/devices')
-  @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Register a device token for push notifications (FCM/APNs via FCM)' })
-  @ApiResponse({ status: 201, description: 'Token registered' })
-  registerDeviceToken(
-    @CurrentUser('id') userId: string,
-    @Body() dto: RegisterDeviceTokenDto,
-  ) {
-    return this.push.registerToken(userId, dto.token, dto.platform);
-  }
-
-  @Get('me/devices')
-  @ApiOperation({ summary: 'List registered device tokens for the authenticated user' })
-  listDeviceTokens(@CurrentUser('id') userId: string) {
-    return this.push.listTokens(userId);
-  }
-
-  @Delete('me/devices/:token')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Remove a device token' })
-  removeDeviceToken(
-    @CurrentUser('id') userId: string,
-    @Param('token') token: string,
-  ) {
-    return this.push.removeToken(userId, token);
-  }
-
-  @Get(':stellarAddress')
-  @ApiOperation({ summary: 'Get public profile by Stellar address' })
-  @ApiResponse({ status: 200, description: 'Returns public profile' })
-  @ApiResponse({ status: 400, description: 'Invalid Stellar address format' })
-  @ApiResponse({ status: 404, description: 'User not found' })
-  getPublicProfile(@Param('stellarAddress') stellarAddress: string) {
-    if (!/^G[A-Z2-7]{55}$/.test(stellarAddress)) {
-      throw new BadRequestException('Invalid Stellar address format');
-    }
-    return this.authService.getPublicProfile(stellarAddress);
-  }
-
-  @Patch('admin/:id/role')
-  @ApiOperation({ summary: "[Admin] Change a user's role" })
-  @ApiResponse({ status: 200, description: 'Updated user profile' })
-  @ApiResponse({ status: 403, description: 'Admin access required' })
-  @ApiResponse({ status: 409, description: 'Admins cannot demote themselves' })
-  updateRole(
-    @Param('id') id: string,
-    @CurrentUser() user: any,
-    @Body() dto: UpdateUserRoleDto,
-  ) {
-    if (user?.role !== 'ADMIN') {
-      throw new ForbiddenException('Admin access required');
-    }
-    return this.authService.updateUserRole(id, user.id, user.stellarAddress, dto.role);
+    return { revokedCount };
   }
 }

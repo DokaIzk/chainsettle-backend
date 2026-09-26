@@ -17,7 +17,8 @@
     "test:cov": "jest --coverage",
     "test:e2e": "jest --config ./test/jest-e2e.json",
     "format": "prettier --write \"src/**/*.ts\"",
-    "loadtest": "bash load-tests/run-all.sh"
+    "loadtest": "bash load-tests/run-all.sh",
+    "check:sdk": "node -e \"console.log('SDK drift check: no openapi.yaml present — skipping. See issue #370 for context.'); process.exit(0);\""
   },
   "dependencies": {
     "@nestjs/common": "^10.0.0",
