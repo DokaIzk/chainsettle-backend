@@ -1,5 +1,6 @@
 /**
- * Unit tests for ApiKeyStrategy.validate() — scope attachment + prior checks.
+ * Unit tests for ApiKeyStrategy.validate() — scope attachment, prior checks,
+ * and grace-period support introduced in issue #367 (key rotation).
  *
  * Tested in isolation (no passport-custom / Prisma types required) to avoid
  * compile-time dependency on the stale generated client.
@@ -16,6 +17,7 @@ interface ApiKeyRow {
   id: string;
   revokedAt: Date | null;
   expiresAt: Date | null;
+  gracePeriodEndsAt: Date | null;
   scopes: string[];
   user: { deactivatedAt: Date | null } | null;
 }
@@ -32,8 +34,19 @@ async function validateApiKey(
   const keyHash = createHash('sha256').update(rawKey).digest('hex');
   const apiKey = await findUnique(keyHash);
 
-  if (!apiKey || apiKey.revokedAt !== null) {
+  if (!apiKey) {
     throw new UnauthorizedException('Invalid or revoked API key');
+  }
+
+  // A revoked key is still allowed during its grace period (rotation window).
+  if (apiKey.revokedAt !== null) {
+    const now = new Date();
+    const inGracePeriod =
+      apiKey.gracePeriodEndsAt !== null && apiKey.gracePeriodEndsAt > now;
+
+    if (!inGracePeriod) {
+      throw new UnauthorizedException('Invalid or revoked API key');
+    }
   }
 
   if (apiKey.expiresAt !== null && apiKey.expiresAt <= new Date()) {
@@ -65,13 +78,16 @@ function makeKey(overrides: Partial<ApiKeyRow> = {}): ApiKeyRow {
     id: 'k1',
     revokedAt: null,
     expiresAt: null,
+    gracePeriodEndsAt: null,
     scopes: ['read', 'write'],
     user: activeUser,
     ...overrides,
   };
 }
 
-describe('ApiKeyStrategy — validate logic (with scopes)', () => {
+describe('ApiKeyStrategy — validate logic (with scopes + grace period)', () => {
+  // ── Basic auth checks ──────────────────────────────────────────────────
+
   it('throws when X-Api-Key header is absent', async () => {
     await expect(validateApiKey(undefined, jest.fn(), jest.fn())).rejects.toThrow(UnauthorizedException);
   });
@@ -80,7 +96,7 @@ describe('ApiKeyStrategy — validate logic (with scopes)', () => {
     await expect(validateApiKey('bad', async () => null, jest.fn())).rejects.toThrow(UnauthorizedException);
   });
 
-  it('throws for a revoked key', async () => {
+  it('throws for a revoked key with no grace period', async () => {
     await expect(
       validateApiKey('k', async () => makeKey({ revokedAt: new Date() }), jest.fn()),
     ).rejects.toThrow('Invalid or revoked API key');
@@ -97,6 +113,23 @@ describe('ApiKeyStrategy — validate logic (with scopes)', () => {
       validateApiKey('k', async () => makeKey({ user: { deactivatedAt: new Date() } }), jest.fn()),
     ).rejects.toThrow('Account has been deactivated');
   });
+
+  it('accepts a valid key with a future expiresAt', async () => {
+    const result = await validateApiKey(
+      'k',
+      async () => makeKey({ expiresAt: futureDate }),
+      jest.fn(),
+    );
+    expect(result).toBeDefined();
+  });
+
+  it('calls updateLastUsed on success', async () => {
+    const updateFn = jest.fn();
+    await validateApiKey('k', async () => makeKey(), updateFn);
+    expect(updateFn).toHaveBeenCalledWith('k1');
+  });
+
+  // ── Scopes ────────────────────────────────────────────────────────────
 
   it('attaches _apiKeyScopes to the returned user for a read-write key', async () => {
     const result = await validateApiKey(
@@ -116,18 +149,53 @@ describe('ApiKeyStrategy — validate logic (with scopes)', () => {
     expect(result._apiKeyScopes).toEqual(['read']);
   });
 
-  it('accepts a valid key with a future expiresAt', async () => {
+  // ── Grace period (rotation) ────────────────────────────────────────────
+
+  it('allows a revoked key that is still within its grace period', async () => {
     const result = await validateApiKey(
       'k',
-      async () => makeKey({ expiresAt: futureDate }),
+      async () =>
+        makeKey({
+          revokedAt: new Date(),           // revoked now…
+          gracePeriodEndsAt: futureDate,   // …but grace window still open
+        }),
       jest.fn(),
     );
     expect(result).toBeDefined();
+    expect(result._apiKeyScopes).toBeDefined();
   });
 
-  it('calls updateLastUsed on success', async () => {
+  it('rejects a revoked key whose grace period has already expired', async () => {
+    await expect(
+      validateApiKey(
+        'k',
+        async () =>
+          makeKey({
+            revokedAt: pastDate,
+            gracePeriodEndsAt: pastDate,  // grace window also in the past
+          }),
+        jest.fn(),
+      ),
+    ).rejects.toThrow('Invalid or revoked API key');
+  });
+
+  it('rejects a revoked key that has gracePeriodEndsAt = null (no grace)', async () => {
+    await expect(
+      validateApiKey(
+        'k',
+        async () => makeKey({ revokedAt: new Date(), gracePeriodEndsAt: null }),
+        jest.fn(),
+      ),
+    ).rejects.toThrow('Invalid or revoked API key');
+  });
+
+  it('still calls updateLastUsed during the grace period', async () => {
     const updateFn = jest.fn();
-    await validateApiKey('k', async () => makeKey(), updateFn);
+    await validateApiKey(
+      'k',
+      async () => makeKey({ revokedAt: new Date(), gracePeriodEndsAt: futureDate }),
+      updateFn,
+    );
     expect(updateFn).toHaveBeenCalledWith('k1');
   });
 });

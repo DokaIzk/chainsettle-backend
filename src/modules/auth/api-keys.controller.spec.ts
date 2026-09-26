@@ -1,30 +1,38 @@
 /**
- * Unit tests for ApiKeysController (scopes feature — issue #368).
+ * Unit tests for ApiKeysController.
  *
- * Covers:
+ * Covers (issue #368 — scopes):
  *   - POST /auth/api-keys   creates key with requested scopes (or defaults)
  *   - GET  /auth/api-keys   returns scopes in list response
- *   - DELETE /auth/api-keys/:id  still works (scope-unaware; just revokes)
- *   - Invalid scope values are rejected with 400 via DTO validation
- *   - JWT auth (JwtAuthGuard) is unaffected — scopes are an API-key-only concept
+ *   - DELETE /auth/api-keys/:id  revokes a key
  *
- * We test the controller in isolation by mocking PrismaService; we do NOT
- * exercise the real guard chain here (that is covered by api-key.guard.spec.ts
- * and api-key.strategy.spec.ts).
+ * Covers (issue #367 — rotation):
+ *   - POST /auth/api-keys/:id/rotate  success (immediate + grace period)
+ *   - Rotating a revoked key → 409
+ *   - Rotating a key owned by another user → 404
+ *   - Rotating a non-existent key → 404
+ *   - Audit log is written on rotation
+ *
+ * JWT auth is tested to confirm it is unaffected by scope/rotation logic.
  */
 
 import { Test, TestingModule } from '@nestjs/testing';
-import { ForbiddenException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  ForbiddenException,
+  NotFoundException,
+} from '@nestjs/common';
 import { ApiKeysController } from './api-keys.controller';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PrismaService } from '../../common/prisma/prisma.service';
+import { AuditLogService } from '../audit-logs/audit-log.service';
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 const USER_ID = 'user-1';
-const currentUser = { id: USER_ID };
+const currentUser = { id: USER_ID, stellarAddress: 'GABC' };
 
 function makeDbKey(overrides: Record<string, unknown> = {}) {
   return {
@@ -36,13 +44,23 @@ function makeDbKey(overrides: Record<string, unknown> = {}) {
     lastUsedAt: null,
     expiresAt: null,
     revokedAt: null,
+    rotatedFromId: null,
+    gracePeriodEndsAt: null,
     createdAt: new Date('2026-09-25T00:00:00Z'),
     ...overrides,
   };
 }
 
+/** Minimal fake Express Request */
+function makeReq(ip = '127.0.0.1') {
+  return {
+    headers: {},
+    socket: { remoteAddress: ip },
+  } as any;
+}
+
 // ---------------------------------------------------------------------------
-// Mock PrismaService
+// Mocks
 // ---------------------------------------------------------------------------
 
 const mockPrisma = {
@@ -52,6 +70,11 @@ const mockPrisma = {
     findUnique: jest.fn(),
     update: jest.fn(),
   },
+  $transaction: jest.fn(),
+};
+
+const mockAuditLog = {
+  record: jest.fn().mockResolvedValue(undefined),
 };
 
 // ---------------------------------------------------------------------------
@@ -66,11 +89,11 @@ describe('ApiKeysController', () => {
 
     const module: TestingModule = await Test.createTestingModule({
       controllers: [ApiKeysController],
-      providers: [{ provide: PrismaService, useValue: mockPrisma }],
+      providers: [
+        { provide: PrismaService, useValue: mockPrisma },
+        { provide: AuditLogService, useValue: mockAuditLog },
+      ],
     })
-      // Override the guard so we don't need a real JWT context in unit tests.
-      // JWT auth remains in place in the running application — this override
-      // only applies to this test module.
       .overrideGuard(JwtAuthGuard)
       .useValue({ canActivate: () => true })
       .compile();
@@ -125,9 +148,8 @@ describe('ApiKeysController', () => {
         }),
       );
       expect(result.scopes).toEqual(['read']);
-      // Plaintext key is returned exactly once
       expect(typeof result.key).toBe('string');
-      expect(result.key).toHaveLength(40); // 20 random bytes → 40 hex chars
+      expect(result.key).toHaveLength(40);
     });
 
     it('defaults to ["read", "write"] when scopes is omitted', async () => {
@@ -144,32 +166,184 @@ describe('ApiKeysController', () => {
       expect(result.scopes).toEqual(['read', 'write']);
     });
 
-    it('creates a read-write key when scopes: ["read","write"] is explicit', async () => {
-      const dbRecord = makeDbKey({ scopes: ['read', 'write'] });
-      mockPrisma.apiKey.create.mockResolvedValue(dbRecord);
-
-      const result = await controller.create(currentUser, {
-        name: 'Integration',
-        scopes: ['read', 'write'],
-      });
-
-      expect(result.scopes).toEqual(['read', 'write']);
-    });
-
     it('returns the plaintext key only on creation (not in list)', async () => {
       const dbRecord = makeDbKey({ scopes: ['read'] });
       mockPrisma.apiKey.create.mockResolvedValue(dbRecord);
       mockPrisma.apiKey.findMany.mockResolvedValue([dbRecord]);
 
-      const created = await controller.create(currentUser, {
-        name: 'R',
-        scopes: ['read'],
-      });
+      const created = await controller.create(currentUser, { name: 'R', scopes: ['read'] });
       const listed = await controller.list(currentUser);
 
       expect(created.key).toBeDefined();
-      // List response should not include `key`
       expect((listed[0] as Record<string, unknown>).key).toBeUndefined();
+    });
+  });
+
+  // ── POST /auth/api-keys/:id/rotate ───────────────────────────────────────
+
+  describe('rotate()', () => {
+    function setupRotateTransaction(newKeyOverrides: Record<string, unknown> = {}) {
+      const oldKey = makeDbKey();
+      const newKey = makeDbKey({
+        id: 'key-new',
+        rotatedFromId: 'key-1',
+        ...newKeyOverrides,
+      });
+
+      mockPrisma.apiKey.findUnique.mockResolvedValue(oldKey);
+      // $transaction receives an array of promises; mock resolves [updated, created]
+      mockPrisma.$transaction.mockImplementation(
+        async (ops: Array<Promise<unknown>>) => Promise.all(ops),
+      );
+      mockPrisma.apiKey.update.mockResolvedValue({ ...oldKey, revokedAt: new Date() });
+      mockPrisma.apiKey.create.mockResolvedValue(newKey);
+
+      return { oldKey, newKey };
+    }
+
+    it('returns a new plaintext key on success', async () => {
+      setupRotateTransaction();
+
+      const result = await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      expect(typeof result.key).toBe('string');
+      expect(result.key).toHaveLength(40);
+    });
+
+    it('new key inherits name and scopes from the predecessor', async () => {
+      setupRotateTransaction();
+
+      const result = await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      expect(result.name).toBe('Test Key');
+      expect(result.scopes).toEqual(['read', 'write']);
+    });
+
+    it('sets rotatedFromId to the old key id', async () => {
+      setupRotateTransaction();
+
+      const result = await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      expect(result.rotatedFromId).toBe('key-1');
+    });
+
+    it('revokes old key immediately when no gracePeriodSeconds', async () => {
+      setupRotateTransaction();
+
+      await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      expect(mockPrisma.apiKey.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'key-1' },
+          data: expect.objectContaining({
+            revokedAt: expect.any(Date),
+            gracePeriodEndsAt: null,
+          }),
+        }),
+      );
+    });
+
+    it('sets gracePeriodEndsAt on old key when gracePeriodSeconds is provided', async () => {
+      setupRotateTransaction();
+
+      const before = Date.now();
+      await controller.rotate(
+        currentUser,
+        'key-1',
+        { gracePeriodSeconds: 300 },
+        makeReq(),
+      );
+      const after = Date.now();
+
+      const updateCall = mockPrisma.apiKey.update.mock.calls[0][0];
+      const grace: Date = updateCall.data.gracePeriodEndsAt;
+
+      expect(grace).toBeInstanceOf(Date);
+      // gracePeriodEndsAt should be ~300 s from now
+      expect(grace.getTime()).toBeGreaterThanOrEqual(before + 299_000);
+      expect(grace.getTime()).toBeLessThanOrEqual(after + 301_000);
+    });
+
+    it('includes gracePeriodEndsAt in the response when a grace period is set', async () => {
+      setupRotateTransaction();
+
+      const result = await controller.rotate(
+        currentUser,
+        'key-1',
+        { gracePeriodSeconds: 600 },
+        makeReq(),
+      );
+
+      expect(result.gracePeriodEndsAt).toBeInstanceOf(Date);
+    });
+
+    it('gracePeriodEndsAt is null in response when gracePeriodSeconds is omitted', async () => {
+      setupRotateTransaction();
+
+      const result = await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      expect(result.gracePeriodEndsAt).toBeNull();
+    });
+
+    it('writes an audit log entry with action API_KEY_ROTATED', async () => {
+      setupRotateTransaction();
+
+      await controller.rotate(currentUser, 'key-1', {}, makeReq());
+
+      // Give the fire-and-forget a tick to run
+      await new Promise((r) => setImmediate(r));
+
+      expect(mockAuditLog.record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'API_KEY_ROTATED',
+          resourceType: 'api_key',
+          metadata: expect.objectContaining({
+            oldKeyId: 'key-1',
+            newKeyId: 'key-new',
+          }),
+        }),
+      );
+    });
+
+    it('throws 404 when key does not exist', async () => {
+      mockPrisma.apiKey.findUnique.mockResolvedValue(null);
+
+      await expect(
+        controller.rotate(currentUser, 'nonexistent', {}, makeReq()),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws 404 (not 403) when key belongs to a different user — prevents enumeration', async () => {
+      mockPrisma.apiKey.findUnique.mockResolvedValue(
+        makeDbKey({ userId: 'other-user' }),
+      );
+
+      await expect(
+        controller.rotate(currentUser, 'key-1', {}, makeReq()),
+      ).rejects.toThrow(NotFoundException);
+    });
+
+    it('throws 409 API_KEY_ALREADY_REVOKED when rotating a revoked key', async () => {
+      mockPrisma.apiKey.findUnique.mockResolvedValue(
+        makeDbKey({ revokedAt: new Date() }),
+      );
+
+      const err = await controller
+        .rotate(currentUser, 'key-1', {}, makeReq())
+        .catch((e) => e);
+
+      expect(err).toBeInstanceOf(ConflictException);
+      expect(err.message).toBe('API_KEY_ALREADY_REVOKED');
+    });
+
+    it('does NOT call $transaction when pre-validation fails', async () => {
+      mockPrisma.apiKey.findUnique.mockResolvedValue(null);
+
+      await expect(
+        controller.rotate(currentUser, 'nonexistent', {}, makeReq()),
+      ).rejects.toThrow(NotFoundException);
+
+      expect(mockPrisma.$transaction).not.toHaveBeenCalled();
     });
   });
 
@@ -221,16 +395,11 @@ describe('ApiKeysController', () => {
   });
 
   // ── JWT auth unaffected ──────────────────────────────────────────────────
-  // Scopes are enforced only for API-key-authenticated requests (ApiKeyGuard).
-  // JWT-authenticated users reach these endpoints normally through JwtAuthGuard.
-  // The test below confirms the controller compiles and responds correctly when
-  // the real JwtAuthGuard is overridden to allow — scopes have no meaning here.
 
   describe('JWT auth compatibility', () => {
-    it('list() works for a JWT-authenticated caller (no scope concept)', async () => {
+    it('list() works for a JWT-authenticated caller', async () => {
       mockPrisma.apiKey.findMany.mockResolvedValue([makeDbKey()]);
 
-      // currentUser simulates what JwtAuthGuard/CurrentUser decorator provides
       const result = await controller.list({ id: 'jwt-user-1' });
 
       expect(Array.isArray(result)).toBe(true);

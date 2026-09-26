@@ -478,12 +478,15 @@ model ApiKey {
   expiryWarningSentAt DateTime?  // set when the 7-day warning notification was sent (prevents duplicates)
   createdAt   DateTime  @default(now())
   revokedAt   DateTime?          // null = active, set = revoked
+  rotatedFromId   String?        // ID of the predecessor key this was rotated from
+  gracePeriodEndsAt DateTime?    // when set, the revoked predecessor key is still valid until this time
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([keyHash])
   @@index([userId])
   @@index([expiresAt])
+  @@index([gracePeriodEndsAt])
   @@map("api_keys")
 }
 
