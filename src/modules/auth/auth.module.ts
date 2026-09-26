@@ -7,6 +7,7 @@ import { AuthService } from './auth.service';
 import { JwtStrategy } from './jwt.strategy';
 import { ApiKeyStrategy } from './api-key.strategy';
 import { ApiKeysController } from './api-keys.controller';
+import { ApiKeyExpiryJob } from './api-key-expiry.job';
 import { UsersController } from './users.controller';
 import { SessionService } from './session.service';
 import { NotificationsModule } from '../notifications/notifications.module';
@@ -26,8 +27,8 @@ import { AuditLogsModule } from '../audit-logs/audit-logs.module';
     NotificationsModule,
     AuditLogsModule,
   ],
-  controllers: [AuthController, UsersController],
-  providers: [AuthService, JwtStrategy, SessionService],
+  controllers: [AuthController, ApiKeysController, UsersController],
+  providers: [AuthService, JwtStrategy, ApiKeyStrategy, ApiKeyExpiryJob, SessionService],
   exports: [AuthService, SessionService],
 })
 export class AuthModule {}

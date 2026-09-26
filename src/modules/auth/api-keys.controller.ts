@@ -1,5 +1,6 @@
 import {
   Controller,
+  Get,
   Post,
   Delete,
   Param,
@@ -30,6 +31,29 @@ export class ApiKeysController {
   constructor(private readonly prisma: PrismaService) {}
 
   // ----------------------------------------------------------
+  // GET /auth/api-keys
+  // Lists all active (non-revoked) keys belonging to the caller
+  // ----------------------------------------------------------
+  @Get()
+  @ApiOperation({ summary: 'List your API keys' })
+  @ApiResponse({ status: 200, description: 'Returns all non-revoked API keys for the caller.' })
+  async list(@CurrentUser() user: { id: string }) {
+    const keys = await this.prisma.apiKey.findMany({
+      where: { userId: user.id, revokedAt: null },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        name: true,
+        lastUsedAt: true,
+        expiresAt: true,
+        createdAt: true,
+      },
+    });
+
+    return keys;
+  }
+
+  // ----------------------------------------------------------
   // POST /auth/api-keys
   // Generates a new API key — plaintext returned only once
   // ----------------------------------------------------------
@@ -52,12 +76,14 @@ export class ApiKeysController {
         userId: user.id,
         keyHash,
         name: dto.name,
+        expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
       },
     });
 
     return {
       id: apiKey.id,
       name: apiKey.name,
+      expiresAt: apiKey.expiresAt,
       createdAt: apiKey.createdAt,
       // Only time the plaintext is ever returned
       key: plaintext,

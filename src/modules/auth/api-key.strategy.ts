@@ -29,6 +29,11 @@ export class ApiKeyStrategy extends PassportStrategy(Strategy, 'api-key') {
       throw new UnauthorizedException('Invalid or revoked API key');
     }
 
+    // Reject keys that have passed their expiry date
+    if (apiKey.expiresAt !== null && apiKey.expiresAt <= new Date()) {
+      throw new UnauthorizedException('API_KEY_EXPIRED');
+    }
+
     if (apiKey.user?.deactivatedAt) {
       throw new UnauthorizedException('Account has been deactivated');
     }

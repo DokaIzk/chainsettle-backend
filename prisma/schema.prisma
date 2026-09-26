@@ -473,6 +473,8 @@ model ApiKey {
   keyHash     String    @unique  // SHA-256 hash of the plaintext key
   name        String             // human label e.g. "CI Pipeline"
   lastUsedAt  DateTime?
+  expiresAt   DateTime?          // null = never expires; set = key expires at this time
+  expiryWarningSentAt DateTime?  // set when the 7-day warning notification was sent (prevents duplicates)
   createdAt   DateTime  @default(now())
   revokedAt   DateTime?          // null = active, set = revoked
 
@@ -480,6 +482,7 @@ model ApiKey {
 
   @@index([keyHash])
   @@index([userId])
+  @@index([expiresAt])
   @@map("api_keys")
 }
 
