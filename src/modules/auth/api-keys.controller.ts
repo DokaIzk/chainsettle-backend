@@ -21,7 +21,8 @@ import { randomBytes, createHash } from 'crypto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { PrismaService } from '../../common/prisma/prisma.service';
-import { CreateApiKeyDto } from './dto/create-api-key.dto';
+import { CreateApiKeyDto, API_KEY_SCOPES } from './dto/create-api-key.dto';
+import { ApiKeyResponseDto } from './dto/api-key-response.dto';
 
 @ApiTags('Auth')
 @ApiBearerAuth()
@@ -36,7 +37,11 @@ export class ApiKeysController {
   // ----------------------------------------------------------
   @Get()
   @ApiOperation({ summary: 'List your API keys' })
-  @ApiResponse({ status: 200, description: 'Returns all non-revoked API keys for the caller.' })
+  @ApiResponse({
+    status: 200,
+    description: 'Returns all non-revoked API keys for the caller, including scopes and expiry.',
+    type: [ApiKeyResponseDto],
+  })
   async list(@CurrentUser() user: { id: string }) {
     const keys = await this.prisma.apiKey.findMany({
       where: { userId: user.id, revokedAt: null },
@@ -44,6 +49,7 @@ export class ApiKeysController {
       select: {
         id: true,
         name: true,
+        scopes: true,
         lastUsedAt: true,
         expiresAt: true,
         createdAt: true,
@@ -62,7 +68,14 @@ export class ApiKeysController {
   @ApiOperation({ summary: 'Generate a new API key (plaintext returned once)' })
   @ApiResponse({
     status: 201,
-    description: 'Key created. Save the plaintext key — it will not be shown again.',
+    description:
+      'Key created. Save the plaintext key — it will not be shown again. ' +
+      'Omit `scopes` for full access (["read","write"]); pass ["read"] for a read-only key.',
+    type: ApiKeyResponseDto,
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Validation failed — invalid scope value or bad expiry date.',
   })
   async create(
     @CurrentUser() user: { id: string },
@@ -71,11 +84,15 @@ export class ApiKeysController {
     const plaintext = randomBytes(20).toString('hex'); // 40 hex chars
     const keyHash = createHash('sha256').update(plaintext).digest('hex');
 
+    // Default to full access when the caller omits scopes
+    const scopes: string[] = dto.scopes ?? [...API_KEY_SCOPES];
+
     const apiKey = await this.prisma.apiKey.create({
       data: {
         userId: user.id,
         keyHash,
         name: dto.name,
+        scopes,
         expiresAt: dto.expiresAt ? new Date(dto.expiresAt) : null,
       },
     });
@@ -83,6 +100,7 @@ export class ApiKeysController {
     return {
       id: apiKey.id,
       name: apiKey.name,
+      scopes: apiKey.scopes,
       expiresAt: apiKey.expiresAt,
       createdAt: apiKey.createdAt,
       // Only time the plaintext is ever returned

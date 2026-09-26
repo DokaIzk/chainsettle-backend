@@ -46,6 +46,12 @@ export class ApiKeyStrategy extends PassportStrategy(Strategy, 'api-key') {
       })
       .catch(() => null);
 
-    return apiKey.user;
+    // Attach scopes alongside the user so ApiKeyGuard can enforce least-privilege.
+    // The _apiKeyScopes property is only present when auth was performed via API key
+    // (not JWT), so guards can detect the auth method if needed.
+    return {
+      ...apiKey.user,
+      _apiKeyScopes: apiKey.scopes as string[],
+    };
   }
 }

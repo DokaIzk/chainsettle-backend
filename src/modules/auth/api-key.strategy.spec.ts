@@ -1,23 +1,22 @@
 /**
- * Unit tests for ApiKeyStrategy.validate()
+ * Unit tests for ApiKeyStrategy.validate() — scope attachment + prior checks.
  *
- * We test the logic directly (expired check, revoked check, deactivated user)
- * without importing passport-custom, which requires native bindings not
- * available in the test environment.
+ * Tested in isolation (no passport-custom / Prisma types required) to avoid
+ * compile-time dependency on the stale generated client.
  */
 
 import { UnauthorizedException } from '@nestjs/common';
 import { createHash } from 'crypto';
-import { Request } from 'express';
 
 // ---------------------------------------------------------------------------
-// Inline the validate() logic so tests don't depend on passport-custom
+// Inline the validate logic (mirrors api-key.strategy.ts)
 // ---------------------------------------------------------------------------
 
 interface ApiKeyRow {
   id: string;
   revokedAt: Date | null;
   expiresAt: Date | null;
+  scopes: string[];
   user: { deactivatedAt: Date | null } | null;
 }
 
@@ -46,7 +45,11 @@ async function validateApiKey(
   }
 
   updateLastUsed(apiKey.id);
-  return apiKey.user;
+
+  return {
+    ...apiKey.user,
+    _apiKeyScopes: apiKey.scopes,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -57,79 +60,74 @@ const pastDate = new Date(Date.now() - 1_000);
 const futureDate = new Date(Date.now() + 86_400_000);
 const activeUser = { deactivatedAt: null };
 
-describe('ApiKeyStrategy — validate logic', () => {
-  it('throws when key header is absent', async () => {
-    await expect(validateApiKey(undefined, jest.fn(), jest.fn())).rejects.toThrow(
-      UnauthorizedException,
-    );
+function makeKey(overrides: Partial<ApiKeyRow> = {}): ApiKeyRow {
+  return {
+    id: 'k1',
+    revokedAt: null,
+    expiresAt: null,
+    scopes: ['read', 'write'],
+    user: activeUser,
+    ...overrides,
+  };
+}
+
+describe('ApiKeyStrategy — validate logic (with scopes)', () => {
+  it('throws when X-Api-Key header is absent', async () => {
+    await expect(validateApiKey(undefined, jest.fn(), jest.fn())).rejects.toThrow(UnauthorizedException);
   });
 
-  it('throws when no matching key exists in the DB', async () => {
-    await expect(
-      validateApiKey('unknown', async () => null, jest.fn()),
-    ).rejects.toThrow(UnauthorizedException);
+  it('throws for an unknown key', async () => {
+    await expect(validateApiKey('bad', async () => null, jest.fn())).rejects.toThrow(UnauthorizedException);
   });
 
   it('throws for a revoked key', async () => {
     await expect(
-      validateApiKey(
-        'key',
-        async () => ({ id: 'k1', revokedAt: new Date(), expiresAt: null, user: activeUser }),
-        jest.fn(),
-      ),
+      validateApiKey('k', async () => makeKey({ revokedAt: new Date() }), jest.fn()),
     ).rejects.toThrow('Invalid or revoked API key');
   });
 
-  it('throws API_KEY_EXPIRED when expiresAt is in the past', async () => {
+  it('throws API_KEY_EXPIRED for an expired key', async () => {
     await expect(
-      validateApiKey(
-        'key',
-        async () => ({ id: 'k2', revokedAt: null, expiresAt: pastDate, user: activeUser }),
-        jest.fn(),
-      ),
+      validateApiKey('k', async () => makeKey({ expiresAt: pastDate }), jest.fn()),
     ).rejects.toMatchObject({ message: 'API_KEY_EXPIRED' });
   });
 
-  it('accepts a key with no expiry set (expiresAt = null)', async () => {
-    const result = await validateApiKey(
-      'key',
-      async () => ({ id: 'k3', revokedAt: null, expiresAt: null, user: activeUser }),
-      jest.fn(),
-    );
-    expect(result).toEqual(activeUser);
-  });
-
-  it('accepts a key whose expiresAt is in the future', async () => {
-    const result = await validateApiKey(
-      'key',
-      async () => ({ id: 'k4', revokedAt: null, expiresAt: futureDate, user: activeUser }),
-      jest.fn(),
-    );
-    expect(result).toEqual(activeUser);
-  });
-
-  it('throws for a deactivated user account', async () => {
+  it('throws for a deactivated account', async () => {
     await expect(
-      validateApiKey(
-        'key',
-        async () => ({
-          id: 'k5',
-          revokedAt: null,
-          expiresAt: futureDate,
-          user: { deactivatedAt: new Date() },
-        }),
-        jest.fn(),
-      ),
+      validateApiKey('k', async () => makeKey({ user: { deactivatedAt: new Date() } }), jest.fn()),
     ).rejects.toThrow('Account has been deactivated');
   });
 
-  it('calls updateLastUsed fire-and-forget on success', async () => {
-    const updateFn = jest.fn();
-    await validateApiKey(
-      'key',
-      async () => ({ id: 'k6', revokedAt: null, expiresAt: null, user: activeUser }),
-      updateFn,
+  it('attaches _apiKeyScopes to the returned user for a read-write key', async () => {
+    const result = await validateApiKey(
+      'k',
+      async () => makeKey({ scopes: ['read', 'write'] }),
+      jest.fn(),
     );
-    expect(updateFn).toHaveBeenCalledWith('k6');
+    expect(result._apiKeyScopes).toEqual(['read', 'write']);
+  });
+
+  it('attaches _apiKeyScopes to the returned user for a read-only key', async () => {
+    const result = await validateApiKey(
+      'k',
+      async () => makeKey({ scopes: ['read'] }),
+      jest.fn(),
+    );
+    expect(result._apiKeyScopes).toEqual(['read']);
+  });
+
+  it('accepts a valid key with a future expiresAt', async () => {
+    const result = await validateApiKey(
+      'k',
+      async () => makeKey({ expiresAt: futureDate }),
+      jest.fn(),
+    );
+    expect(result).toBeDefined();
+  });
+
+  it('calls updateLastUsed on success', async () => {
+    const updateFn = jest.fn();
+    await validateApiKey('k', async () => makeKey(), updateFn);
+    expect(updateFn).toHaveBeenCalledWith('k1');
   });
 });
