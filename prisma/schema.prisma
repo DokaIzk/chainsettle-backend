@@ -191,6 +191,7 @@ model Milestone {
   overdueNotifiedAt  DateTime?       // timestamp when overdue notification was sent (prevents re-notification)
   overdueReminder3dAt DateTime?       // timestamp when 3-day escalation notification was sent
   disputeEscalatedAt DateTime?       // set when the dispute has been escalated to admins (prevents re-escalation)
+  deletedAt          DateTime?       // soft-delete marker; set by DELETE /shipments/:id/milestones/:index (#306)
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
 
@@ -312,15 +313,19 @@ model ShipmentComment {
   visibility    CommentVisibility @default(ALL)
   attachmentCid String?
   pinnedAt      DateTime?         // set when pinned; null when unpinned (max 3 per shipment)
+  parentCommentId String?         // set when this comment is a reply to another comment (#299)
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
   deletedAt     DateTime?
 
-  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
-  author   User     @relation(fields: [authorId], references: [id])
+  shipment Shipment          @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  author   User              @relation(fields: [authorId], references: [id])
+  parent   ShipmentComment?  @relation("CommentReplies", fields: [parentCommentId], references: [id], onDelete: SetNull)
+  replies  ShipmentComment[] @relation("CommentReplies")
 
   @@index([shipmentId])
   @@index([authorId])
+  @@index([parentCommentId])
   @@map("shipment_comments")
 }
 
@@ -454,6 +459,7 @@ model ShipmentTemplate {
   tokenAddress      String?
   milestoneTemplates Json    // array of { name, paymentPercent, dueDays? }
   isPublic          Boolean  @default(false)
+  deletedAt         DateTime? // soft-delete marker; set by DELETE /shipment-templates/:id (#306)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 

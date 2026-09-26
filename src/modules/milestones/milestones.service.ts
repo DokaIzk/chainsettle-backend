@@ -12,7 +12,6 @@ import { IpfsService } from '../../common/ipfs/ipfs.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ShipmentsService } from '../shipments/shipments.service';
 import { ShipmentApprovalsService } from '../shipments/shipment-approvals.service';
-import { AuditLogService } from '../audit-logs/audit-log.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
 import { AppendMilestoneDto } from './dto/append-milestone.dto';
@@ -34,7 +33,7 @@ export class MilestonesService {
   ) {}
 
   async findByShipment(shipmentId: string, status?: string, overdueOnly = false, precisionOverride?: number) {
-    const where: any = { shipmentId };
+    const where: any = { shipmentId, deletedAt: null };
 
     if (status) {
       where.status = status;
@@ -92,7 +91,7 @@ export class MilestonesService {
 
   async findOne(shipmentId: string, milestoneIndex: number) {
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
     });
     if (!milestone) {
       throw new NotFoundException(
@@ -113,7 +112,7 @@ export class MilestonesService {
     }
 
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
       select: { id: true },
     });
 
@@ -293,7 +292,7 @@ export class MilestonesService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      include: { milestones: true },
+      include: { milestones: { where: { deletedAt: null } } },
     });
 
     if (!shipment) {
@@ -502,7 +501,7 @@ export class MilestonesService {
 
   async getDisputeDetail(shipmentId: string, milestoneIndex: number) {
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
     });
 
     if (!milestone) {
@@ -552,7 +551,7 @@ export class MilestonesService {
   ) {
     // Get milestone and shipment
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
       include: { shipment: true },
     });
 
@@ -660,7 +659,7 @@ export class MilestonesService {
   ) {
     // Get milestone and shipment
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
       include: { shipment: true },
     });
 
@@ -725,7 +724,7 @@ export class MilestonesService {
     isAdmin: boolean,
   ) {
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
       include: { shipment: true },
     });
 
@@ -783,7 +782,7 @@ export class MilestonesService {
     evidenceId: string,
   ): Promise<{ fileBuffer: Buffer; fileName: string; mimeType: string }> {
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
     });
 
     if (!milestone) {
@@ -883,7 +882,7 @@ export class MilestonesService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      include: { milestones: true },
+      include: { milestones: { where: { deletedAt: null } } },
     });
 
     if (!shipment) {
@@ -992,7 +991,7 @@ export class MilestonesService {
    */
   async getProofHistory(shipmentId: string, milestoneIndex: number) {
     const milestone = await this.prisma.milestone.findUnique({
-      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
     });
 
     if (!milestone) {
@@ -1044,7 +1043,7 @@ export class MilestonesService {
     }
 
     const existingMilestones = await this.prisma.milestone.findMany({
-      where: { shipmentId },
+      where: { shipmentId, deletedAt: null },
       orderBy: { milestoneIndex: 'asc' },
     });
 
@@ -1073,11 +1072,13 @@ export class MilestonesService {
       );
     }
 
-    // Assign the next sequential index
-    const nextIndex =
-      existingMilestones.length > 0
-        ? existingMilestones[existingMilestones.length - 1].milestoneIndex + 1
-        : 0;
+    // Assign the next sequential index. Soft-deleted rows still hold their
+    // (shipmentId, milestoneIndex) slot, so count them when picking it.
+    const { _max } = await this.prisma.milestone.aggregate({
+      where: { shipmentId },
+      _max: { milestoneIndex: true },
+    });
+    const nextIndex = _max.milestoneIndex != null ? _max.milestoneIndex + 1 : 0;
 
     const milestone = await this.prisma.milestone.create({
       data: {
@@ -1118,7 +1119,7 @@ export class MilestonesService {
     }
 
     const allMilestones = await this.prisma.milestone.findMany({
-      where: { shipmentId },
+      where: { shipmentId, deletedAt: null },
       orderBy: { milestoneIndex: 'asc' },
     });
 
@@ -1168,8 +1169,112 @@ export class MilestonesService {
     this.logger.log(`Milestones rebalanced for ${shipmentId} by buyer ${callerAddress}`);
 
     return this.prisma.milestone.findMany({
-      where: { shipmentId },
+      where: { shipmentId, deletedAt: null },
       orderBy: { milestoneIndex: 'asc' },
     });
+  }
+
+  // ----------------------------------------------------------
+  // REMOVE MILESTONE — soft-delete a still-pending milestone
+  // ----------------------------------------------------------
+
+  /**
+   * Removes a pending milestone from a shipment. Only allowed when ALL
+   * milestones on the shipment (including the target) are still PENDING.
+   * Restricted to the shipment buyer.
+   *
+   * The row is soft-deleted (deletedAt is set) rather than removed (#306), so
+   * the audit log entry's resourceId keeps resolving to it.
+   */
+  async removeMilestone(
+    shipmentId: string,
+    milestoneIndex: number,
+    callerAddress: string,
+    callerId?: string,
+  ) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentId} not found`);
+    }
+
+    if (shipment.buyerAddress !== callerAddress) {
+      throw new ForbiddenException('Only the shipment buyer may remove milestones');
+    }
+
+    const milestone = await this.prisma.milestone.findUnique({
+      where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex }, deletedAt: null },
+    });
+
+    if (!milestone) {
+      throw new NotFoundException(
+        `Milestone ${milestoneIndex} not found on shipment ${shipmentId}`,
+      );
+    }
+
+    // Reject if the target milestone has left PENDING
+    if (milestone.status !== MilestoneStatus.PENDING) {
+      throw new ConflictException(
+        `Cannot remove milestone ${milestoneIndex} ("${milestone.name}"): ` +
+        `status is ${milestone.status}, expected PENDING.`,
+      );
+    }
+
+    const allMilestones = await this.prisma.milestone.findMany({
+      where: { shipmentId, deletedAt: null },
+    });
+
+    // Reject if any OTHER milestone has left PENDING
+    const otherNonPending = allMilestones.find(
+      (m) => m.milestoneIndex !== milestoneIndex && m.status !== MilestoneStatus.PENDING,
+    );
+    if (otherNonPending) {
+      throw new ConflictException(
+        `Cannot remove milestone: milestone ${otherNonPending.milestoneIndex} ("${otherNonPending.name}") ` +
+        `is in status ${otherNonPending.status}, expected PENDING. ` +
+        `Work has already started on this shipment.`,
+      );
+    }
+
+    // Reject if this is the only remaining milestone
+    if (allMilestones.length <= 1) {
+      throw new BadRequestException(
+        'Cannot remove the only milestone on a shipment. A shipment must have at least one milestone.',
+      );
+    }
+
+    const milestoneData = {
+      id: milestone.id,
+      milestoneIndex: milestone.milestoneIndex,
+      name: milestone.name,
+      paymentPercent: milestone.paymentPercent,
+      status: milestone.status,
+      dueAt: milestone.dueAt?.toISOString() ?? null,
+    };
+
+    await this.prisma.milestone.update({
+      where: { id: milestone.id },
+      data: { deletedAt: new Date() },
+    });
+
+    await this.auditLog.record({
+      actorId: callerId,
+      actorAddress: callerAddress,
+      action: 'milestone.removed',
+      resourceType: 'Milestone',
+      resourceId: milestone.id,
+      metadata: {
+        shipmentId,
+        removedMilestone: milestoneData,
+      },
+    });
+
+    this.logger.log(
+      `Milestone ${milestoneIndex} ("${milestone.name}") removed from ${shipmentId} by buyer ${callerAddress}`,
+    );
+
+    return { removed: true, milestone: milestoneData };
   }
 }
