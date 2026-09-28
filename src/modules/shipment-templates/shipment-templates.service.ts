@@ -121,7 +121,13 @@ export class ShipmentTemplatesService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
+      include: {
+        milestones: {
+          where: { deletedAt: null },
+          orderBy: { milestoneIndex: 'asc' },
+          include: { checklistItems: { orderBy: { createdAt: 'asc' } } },
+        },
+      },
     });
 
     if (!shipment) {
@@ -138,6 +144,9 @@ export class ShipmentTemplatesService {
       paymentPercent: m.paymentPercent,
       ...(m.dueAt
         ? { dueDays: Math.round((m.dueAt.getTime() - shipment.createdAt.getTime()) / msPerDay) }
+        : {}),
+      ...(m.checklistItems.length > 0
+        ? { checklist: m.checklistItems.map((c) => ({ label: c.label, required: c.required })) }
         : {}),
     }));
 
@@ -182,6 +191,7 @@ export class ShipmentTemplatesService {
       name: m.name,
       paymentPercent: m.paymentPercent,
       dueDays: m.dueDays ?? null,
+      checklist: Array.isArray(m.checklist) ? m.checklist : [],
       dueDescription:
         m.dueDays != null ? `${m.dueDays} day${m.dueDays === 1 ? '' : 's'} after creation` : 'No due date set',
     }));

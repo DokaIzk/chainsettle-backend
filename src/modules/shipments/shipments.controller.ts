@@ -48,6 +48,7 @@ import { ValidateMetadataDto } from './dto/metadata.dto';
 import { ShipmentParticipantGuard } from './guards/shipment-participant.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole } from '@prisma/client';
+import { parseFields, SHIPMENT_LIST_FIELDS, SHIPMENT_DETAIL_FIELDS } from './shipment-fields';
 import { RedisService } from '../../common/redis/redis.service';
 
 @ApiTags('shipments')
@@ -143,7 +144,9 @@ export class ShipmentsController {
     const isAdmin = user?.role === UserRole.ADMIN;
     const tags = query.tags ? query.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
 
-    return this.shipmentsService.findAll({
+    const fields = parseFields(query.fields, SHIPMENT_LIST_FIELDS);
+
+    return this.shipmentsService.findAllCached({
       buyerAddress: isAdmin ? query.buyerAddress : undefined,
       supplierAddress: isAdmin ? query.supplierAddress : undefined,
       status: query.status,
@@ -163,6 +166,7 @@ export class ShipmentsController {
       isDraft: query.isDraft,
       favorite: query.favorite,
       callerUserId: user?.id,
+      fields,
     });
   }
 
@@ -375,9 +379,17 @@ export class ShipmentsController {
   @ApiResponse({ status: 200, description: 'Shipment found' })
   @ApiResponse({ status: 404, description: 'Shipment not found' })
   @ApiQuery({ name: 'precision', required: false, type: Number, description: 'Override decimal places for FX-converted values (e.g. 0 for JPY, 2 for USD). Defaults to currency-appropriate value.' })
-  findOne(@Param('id') id: string, @CurrentUser() user: any, @Query('precision') precision?: string) {
+  @ApiQuery({ name: 'fields', required: false, type: String, description: `Comma-separated sparse fieldset; id is always included. Valid: ${SHIPMENT_DETAIL_FIELDS.join(', ')}` })
+  @ApiResponse({ status: 400, description: 'Unknown field requested' })
+  findOne(
+    @Param('id') id: string,
+    @CurrentUser() user: any,
+    @Query('precision') precision?: string,
+    @Query('fields') fieldsRaw?: string,
+  ) {
     const precisionOverride = precision !== undefined ? parseInt(precision, 10) : undefined;
-    return this.shipmentsService.findOne(id, user?.id, precisionOverride);
+    const fields = parseFields(fieldsRaw, SHIPMENT_DETAIL_FIELDS);
+    return this.shipmentsService.findOne(id, user?.id, precisionOverride, fields);
   }
 
   /**

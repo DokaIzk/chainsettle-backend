@@ -35,6 +35,7 @@ import { ArbitersModule } from './modules/arbiters/arbiters.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
 import { GraphqlModule } from './modules/graphql/graphql.module';
 import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
+import { PerformanceModule } from './modules/performance/performance.module';
 
 @Module({
   imports: [
@@ -93,6 +94,7 @@ import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.
     FeatureFlagsModule,
     GraphqlModule,
     AdminDashboardModule,
+    PerformanceModule,
   ],
   providers: [
     // Apply global throttler guard (sets X-RateLimit-* on success and 429)
