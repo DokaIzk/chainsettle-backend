@@ -11,19 +11,42 @@ import { WebhooksService } from '../webhooks/webhooks.service';
 import { PushNotificationService } from './push-notification.service';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { DEFAULT_LOCALE, I18nService } from '../../i18n/i18n.service';
+import { SmsProviderFactory } from '../../common/providers/sms.provider';
 
-type ChannelPrefs = { inApp: boolean; email: boolean; slack?: boolean };
+type ChannelPrefs = { inApp: boolean; email: boolean; slack?: boolean; sms?: boolean; discord?: boolean };
 type PreferenceMap = Record<NotificationType, ChannelPrefs>;
 export type DigestFrequency = 'instant' | 'daily' | 'weekly';
 type StoredPreferences = PreferenceMap & {
   _meta?: { digestFrequency?: DigestFrequency };
 };
 
+type NotificationGroup = {
+  key: string;
+  shipmentId: string | null;
+  referenceNumber: string | null;
+  unreadCount: number;
+  latestAt: Date;
+  notifications: any[];
+};
+
 const DEFAULT_DIGEST_FREQUENCY: DigestFrequency = 'daily';
+
+// SMS is only allowed for these notification types
+export const SMS_ALLOWED_TYPES: NotificationType[] = [
+  NotificationType.DISPUTE_RAISED,
+  NotificationType.DISPUTE_RESOLVED,
+  NotificationType.PAYMENT_RELEASED,
+  NotificationType.MILESTONE_OVERDUE,
+];
+
+// Max SMS per user per 24-hour window
+const SMS_RATE_LIMIT = 10;
 
 function buildDefaultPreferences(): PreferenceMap {
   return Object.values(NotificationType).reduce((acc, type) => {
-    acc[type] = { inApp: true, email: true, slack: true };
+    const smsDefault = false;
+    const discordDefault = false;
+    acc[type] = { inApp: true, email: true, slack: true, sms: smsDefault, discord: discordDefault };
     return acc;
   }, {} as PreferenceMap);
 }
@@ -33,6 +56,8 @@ function normalizeChannelPrefs(raw: Partial<ChannelPrefs> | undefined): ChannelP
     inApp: raw?.inApp ?? true,
     email: raw?.email ?? true,
     slack: raw?.slack ?? true,
+    sms: raw?.sms ?? false,
+    discord: raw?.discord ?? false,
   };
 }
 
@@ -40,6 +65,7 @@ function normalizeChannelPrefs(raw: Partial<ChannelPrefs> | undefined): ChannelP
 export class NotificationsService {
   private readonly logger = new Logger(NotificationsService.name);
   private transporter: nodemailer.Transporter;
+  private smsProvider: ReturnType<SmsProviderFactory['create']>;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -47,6 +73,7 @@ export class NotificationsService {
     private readonly i18n: I18nService,
     @Optional() private readonly gateway: NotificationsGateway,
     @Optional() private readonly webhooks: WebhooksService,
+    @Optional() private readonly smsProviderFactory: SmsProviderFactory,
   ) {
     this.transporter = nodemailer.createTransport({
       host: this.config.get('SMTP_HOST'),
@@ -57,6 +84,11 @@ export class NotificationsService {
         pass: this.config.get('SMTP_PASS'),
       },
     });
+
+    // Initialize SMS provider if configured
+    if (this.smsProviderFactory) {
+      this.smsProvider = this.smsProviderFactory.create();
+    }
   }
 
   /**
@@ -83,8 +115,8 @@ export class NotificationsService {
         return;
       }
 
-      const { preferences: prefs, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
-      const { inApp, email: emailEnabled, slack: slackEnabled } = normalizeChannelPrefs(prefs[type]);
+      const { preferences: prefs, slackWebhookUrl, discordWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
+      const { inApp, email: emailEnabled, slack: slackEnabled, sms: smsEnabled, discord: discordEnabled } = normalizeChannelPrefs(prefs[type]);
 
       if (!inApp) return;
 
@@ -102,6 +134,16 @@ export class NotificationsService {
 
       if (slackEnabled && slackWebhookUrl) {
         await this.sendSlackMessage(slackWebhookUrl, type, title, message, data);
+      }
+
+      // Send SMS if enabled, user has verified phone, type is allowed, and rate limit not exceeded
+      if (smsEnabled && user.phoneVerified && user.phoneNumber && SMS_ALLOWED_TYPES.includes(type)) {
+        await this.sendSmsNotification(user.id, user.phoneNumber, type, title, message, data);
+      }
+
+      // Send Discord notification if enabled and webhook is configured
+      if (discordEnabled && discordWebhookUrl) {
+        await this.sendDiscordMessage(discordWebhookUrl, type, title, message, data);
       }
 
       this.gateway?.pushToUser(user.id, notification);
@@ -245,6 +287,7 @@ export class NotificationsService {
   private async getOrCreatePreferenceRecord(userId: string): Promise<{
     preferences: PreferenceMap;
     slackWebhookUrl: string | null;
+    discordWebhookUrl: string | null;
   }> {
     const record = await this.prisma.notificationPreference.upsert({
       where: { userId },
@@ -254,6 +297,7 @@ export class NotificationsService {
     return {
       preferences: record.preferences as PreferenceMap,
       slackWebhookUrl: record.slackWebhookUrl ?? null,
+      discordWebhookUrl: record.discordWebhookUrl ?? null,
     };
   }
 
@@ -264,7 +308,7 @@ export class NotificationsService {
       merged._meta = { ...current._meta, digestFrequency: dto.digestFrequency };
     }
 
-    const data: { preferences: StoredPreferences; slackWebhookUrl?: string | null } = {
+    const data: { preferences: StoredPreferences; slackWebhookUrl?: string | null; discordWebhookUrl?: string | null } = {
       preferences: merged,
     };
     if (dto.slackWebhookUrl !== undefined) {
@@ -272,6 +316,12 @@ export class NotificationsService {
         dto.slackWebhookUrl === '' || dto.slackWebhookUrl === null
           ? null
           : dto.slackWebhookUrl;
+    }
+    if (dto.discordWebhookUrl !== undefined) {
+      data.discordWebhookUrl =
+        dto.discordWebhookUrl === '' || dto.discordWebhookUrl === null
+          ? null
+          : dto.discordWebhookUrl;
     }
 
     await this.prisma.notificationPreference.update({
@@ -291,19 +341,83 @@ export class NotificationsService {
   }
 
   async getPreferencesResponse(userId: string) {
-    const { preferences, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(userId);
+    const { preferences, slackWebhookUrl, discordWebhookUrl } = await this.getOrCreatePreferenceRecord(userId);
     const stored = preferences as StoredPreferences;
     const { _meta, ...typePreferences } = stored;
     return {
       ...typePreferences,
       digestFrequency: _meta?.digestFrequency ?? DEFAULT_DIGEST_FREQUENCY,
       slackWebhookUrl,
+      discordWebhookUrl,
     };
   }
 
-  async findForUser(userId: string, unreadOnly = false, page = 1, limit = 20) {
+  async findForUser(
+    userId: string,
+    unreadOnly = false,
+    page = 1,
+    limit = 20,
+    groupBy?: 'shipment' | 'none',
+  ) {
     const where: any = { userId };
     if (unreadOnly) where.read = false;
+
+    if (groupBy === 'shipment') {
+      const notifications = await this.prisma.notification.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+      });
+
+      const groups = new Map<string, NotificationGroup>();
+      const shipmentIds = Array.from(
+        new Set(
+          notifications
+            .map((n) => (n.data && typeof n.data === 'object' && 'shipmentId' in n.data ? String((n.data as any).shipmentId) : null))
+            .filter((id): id is string => Boolean(id)),
+        ),
+      );
+
+      const shipments = shipmentIds.length
+        ? await this.prisma.shipment.findMany({
+            where: { id: { in: shipmentIds } },
+            select: { id: true, referenceNumber: true },
+          })
+        : [];
+      const shipmentMap = new Map(shipments.map((s) => [s.id, s]));
+
+      for (const notification of notifications) {
+        const shipmentId = notification.data && typeof notification.data === 'object' && 'shipmentId' in notification.data
+          ? String((notification.data as any).shipmentId)
+          : null;
+        const key = shipmentId ?? '__general__';
+        const group = groups.get(key) ?? {
+          key,
+          shipmentId,
+          referenceNumber: shipmentId ? shipmentMap.get(shipmentId)?.referenceNumber ?? null : null,
+          unreadCount: 0,
+          latestAt: notification.createdAt,
+          notifications: [],
+        };
+
+        group.notifications.push(notification);
+        group.latestAt = new Date(Math.max(new Date(group.latestAt).getTime(), new Date(notification.createdAt).getTime()));
+        group.unreadCount += notification.read ? 0 : 1;
+        groups.set(key, group);
+      }
+
+      const grouped = Array.from(groups.values())
+        .map((group) => ({
+          ...group,
+          notifications: group.notifications
+            .slice()
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+            .slice(0, 3),
+        }))
+        .sort((a, b) => new Date(b.latestAt).getTime() - new Date(a.latestAt).getTime())
+        .slice((page - 1) * limit, page * limit);
+
+      return { data: grouped, meta: { total: grouped.length, page, limit } };
+    }
 
     const [notifications, total] = await this.prisma.$transaction([
       this.prisma.notification.findMany({
@@ -316,6 +430,21 @@ export class NotificationsService {
     ]);
 
     return { data: notifications, meta: { total, page, limit } };
+  }
+
+  async markReadByShipment(userId: string, shipmentId: string) {
+    const result = await this.prisma.notification.updateMany({
+      where: {
+        userId,
+        read: false,
+        data: {
+          path: ['shipmentId'],
+          equals: shipmentId,
+        },
+      },
+      data: { read: true },
+    });
+    return { updatedCount: result.count };
   }
 
   async findOne(userId: string, id: string) {
@@ -517,6 +646,165 @@ export class NotificationsService {
       this.logger.log(`Slack notification sent for ${type}: ${title}`);
     } catch (error) {
       this.logger.error(`Slack notification failed for ${type}`, (error as Error).message);
+    }
+  }
+
+  /**
+   * Sends an SMS notification to a user's phone number.
+   * Applies rate limiting (10 SMS per user per 24h) and checks the user's preference.
+   * Only sends for allowed notification types.
+   */
+  private async sendSmsNotification(
+    userId: string,
+    phoneNumber: string,
+    type: NotificationType,
+    title: string,
+    message: string,
+    data?: Record<string, any>,
+  ): Promise<void> {
+    if (!this.smsProvider) {
+      this.logger.debug('SMS provider not configured, skipping SMS');
+      return;
+    }
+
+    try {
+      // Check rate limit using the preference record
+      const pref = await this.prisma.notificationPreference.findUnique({
+        where: { userId },
+      });
+
+      if (!pref) {
+        return;
+      }
+
+      const now = new Date();
+      const windowStart = pref.smsWindowStart;
+      const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+      // Reset count if we're past the 24h window
+      let currentCount = pref.smsSentCount;
+      if (windowStart < twentyFourHoursAgo) {
+        currentCount = 0;
+        await this.prisma.notificationPreference.update({
+          where: { userId },
+          data: { smsSentCount: 0, smsWindowStart: now },
+        });
+      }
+
+      if (currentCount >= SMS_RATE_LIMIT) {
+        this.logger.warn(`SMS rate limit exceeded for user ${userId}`);
+        return;
+      }
+
+      // Format SMS message - keep it concise
+      const smsBody = `ChainSettle: ${title} - ${message.substring(0, 140)}`;
+
+      await this.smsProvider.sendSms(phoneNumber, smsBody);
+
+      // Increment sent count
+      await this.prisma.notificationPreference.update({
+        where: { userId },
+        data: { smsSentCount: currentCount + 1 },
+      });
+
+      this.logger.log(`SMS notification sent for ${type}: ${title}`);
+    } catch (error) {
+      this.logger.error(`SMS notification failed for ${type}`, (error as Error).message);
+    }
+  }
+
+  /**
+   * Posts a Discord webhook message for a notification event.
+   * Uses Discord embed format and handles rate limiting (429) with retry.
+   */
+  async sendDiscordMessage(
+    webhookUrl: string,
+    type: NotificationType,
+    title: string,
+    message: string,
+    data?: Record<string, any>,
+  ): Promise<void> {
+    try {
+      const shipmentId = data?.shipmentId ? String(data.shipmentId) : undefined;
+      const milestoneIndex = data?.milestoneIndex !== undefined ? String(data.milestoneIndex) : undefined;
+
+      // Color based on notification type
+      const colorMap: Record<string, number> = {
+        DISPUTE_RAISED: 0xff0000,      // Red
+        DISPUTE_RESOLVED: 0x00ff00,    // Green
+        PAYMENT_RELEASED: 0x00ff00,    // Green
+        MILESTONE_OVERDUE: 0xffaa00,   // Orange
+        PROOF_SUBMITTED: 0x0099ff,     // Blue
+        MILESTONE_CONFIRMED: 0x00ff00, // Green
+        SHIPMENT_CANCELLED: 0xff0000,  // Red
+        COMMENT_ADDED: 0x888888,       // Gray
+        SYSTEM_ALERT: 0xffaa00,        // Orange
+      };
+      const color = colorMap[type] || 0x666666;
+
+      const embed: any = {
+        title: `ChainSettle — ${title}`,
+        description: message,
+        color,
+        timestamp: new Date().toISOString(),
+        footer: { text: 'ChainSettle' },
+        fields: [],
+      };
+
+      if (shipmentId) {
+        embed.fields.push({ name: 'Shipment', value: shipmentId, inline: true });
+      }
+      if (milestoneIndex !== undefined) {
+        embed.fields.push({ name: 'Milestone', value: milestoneIndex, inline: true });
+      }
+      embed.fields.push({ name: 'Type', value: type, inline: true });
+
+      const payload = {
+        embeds: [embed],
+      };
+
+      const response = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      if (response.status === 429) {
+        // Handle rate limiting - Discord sends retry_after in the response
+        const retryAfter = response.headers.get('retry-after');
+        const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 5000;
+        this.logger.warn(`Discord rate limited, waiting ${waitMs}ms before retry`);
+        
+        // Wait and retry once
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        
+        const retryResponse = await fetch(webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        
+        if (!retryResponse.ok) {
+          const body = await retryResponse.text().catch(() => '');
+          this.logger.error(`Discord webhook retry failed (${retryResponse.status}): ${body || retryResponse.statusText}`);
+          return;
+        }
+        
+        this.logger.log(`Discord notification sent for ${type}: ${title} (after retry)`);
+        return;
+      }
+
+      if (!response.ok) {
+        const body = await response.text().catch(() => '');
+        this.logger.error(
+          `Discord webhook failed (${response.status}): ${body || response.statusText}`,
+        );
+        return;
+      }
+
+      this.logger.log(`Discord notification sent for ${type}: ${title}`);
+    } catch (error) {
+      this.logger.error(`Discord notification failed for ${type}`, (error as Error).message);
     }
   }
 }

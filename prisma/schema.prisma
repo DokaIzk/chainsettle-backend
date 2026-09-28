@@ -96,6 +96,9 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  phoneNumber      String?   // E.164 format (e.g., +14155551234)
+  phoneVerified    Boolean   @default(false)
+  pendingPhone     String?   // pending verification change
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -273,6 +276,7 @@ model Notification {
 
   @@index([userId])
   @@index([read])
+  @@index([(data->>'shipmentId')])
   @@map("notifications")
 }
 
@@ -385,8 +389,11 @@ model AuditLog {
 model NotificationPreference {
   id              String   @id @default(uuid())
   userId          String   @unique
-  preferences     Json     // Record<NotificationType, { inApp: boolean; email: boolean; slack: boolean }>
+  preferences     Json     // Record<NotificationType, { inApp: boolean; email: boolean; slack: boolean; sms: boolean; discord: boolean }>
   slackWebhookUrl String?  // Incoming Slack webhook URL; null disables Slack delivery
+  discordWebhookUrl String? // Incoming Discord webhook URL; null disables Discord delivery
+  smsSentCount    Int      @default(0)   // SMS sent this rolling 24h window
+  smsWindowStart  DateTime @default(now()) // Start of current 24h rate-limit window
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 

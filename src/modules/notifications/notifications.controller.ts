@@ -23,8 +23,18 @@ export class NotificationsController {
     @Query('unreadOnly') unreadOnly?: boolean,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
+    @Query('groupBy') groupBy?: 'shipment' | 'none',
   ) {
-    return this.notificationsService.findForUser(userId, unreadOnly, page, limit);
+    return this.notificationsService.findForUser(userId, unreadOnly, page, limit, groupBy);
+  }
+
+  @Post('read-by-shipment/:shipmentId')
+  @ApiOperation({ summary: 'Mark all notifications for a shipment as read' })
+  async markReadByShipment(
+    @CurrentUser('id') userId: string,
+    @Param('shipmentId') shipmentId: string,
+  ) {
+    return this.notificationsService.markReadByShipment(userId, shipmentId);
   }
 
   @Patch(':id/read')
