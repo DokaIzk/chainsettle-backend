@@ -402,6 +402,7 @@ model WebhookEndpoint {
   url        String
   secret     String    // SHA-256 hash of the plaintext signing secret
   events     String[]  // NotificationType values this endpoint subscribes to
+  headers    Json?     // Encrypted custom headers: { "name": "encrypted-value", ... }
   active     Boolean   @default(true)
   createdAt  DateTime  @default(now())
 
