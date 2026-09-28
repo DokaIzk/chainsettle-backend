@@ -120,4 +120,48 @@ export class RedisService implements OnModuleDestroy {
   async srem(key: string, ...members: string[]): Promise<void> {
     await this.client.srem(key, ...members);
   }
+
+  // ------------------------------------------------------------------
+  // Distributed lock helpers (used by scheduled jobs)
+  // ------------------------------------------------------------------
+
+  /**
+   * Acquire a distributed lock using SET NX PX.
+   * Returns true if the lock was obtained, false if already held.
+   */
+  async acquireLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+    const result = await this.client.set(key, token, 'PX', ttlMs, 'NX');
+    return result === 'OK';
+  }
+
+  /**
+   * Release a lock only if the caller still owns it (Lua CAS).
+   * Safe against accidental release by a different token.
+   */
+  async releaseLock(key: string, token: string): Promise<void> {
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+    await this.client.eval(script, 1, key, token);
+  }
+
+  /**
+   * Extend the TTL of a lock if the caller still owns it.
+   * Returns true if the renewal succeeded.
+   */
+  async renewLock(key: string, token: string, ttlMs: number): Promise<boolean> {
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("pexpire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+    const result = await this.client.eval(script, 1, key, token, String(ttlMs));
+    return result === 1;
+  }
 }
