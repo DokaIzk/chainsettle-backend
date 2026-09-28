@@ -76,6 +76,7 @@ export const envValidationSchema = Joi.object({
   // Webhooks
   WEBHOOK_DELIVERY_TIMEOUT_MS: Joi.number().integer().min(1000).max(600000).default(10000),
   WEBHOOK_MAX_PAYLOAD_BYTES: Joi.number().integer().min(1024).max(50 * 1024 * 1024).default(256 * 1024),
+  WEBHOOK_HEADERS_ENCRYPTION_KEY: Joi.string().length(32).default('change-me-webhook-headers-key!!!!'),
 
   // KYC/AML (#233)
   // Shipments with totalAmount (in stroops) at or above this threshold require
