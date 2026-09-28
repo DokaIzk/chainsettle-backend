@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
@@ -18,6 +18,7 @@ type PreferenceMap = Record<NotificationType, ChannelPrefs>;
 export type DigestFrequency = 'instant' | 'daily' | 'weekly';
 type StoredPreferences = PreferenceMap & {
   _meta?: { digestFrequency?: DigestFrequency };
+  _quietHours?: { enabled: boolean; start: string; end: string; timezone: string };
 };
 
 const DEFAULT_DIGEST_FREQUENCY: DigestFrequency = 'daily';
@@ -87,15 +88,17 @@ export class NotificationsService {
       }
 
       const { preferences: prefs, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
+      const quietHours = (prefs as StoredPreferences)._quietHours;
+      const deliverAfter = type === NotificationType.SYSTEM_ALERT && data?.urgent === true ? null : this.getQuietHoursEnd(new Date(), quietHours);
       const { inApp, email: emailEnabled, slack: slackEnabled, push: pushEnabled } = normalizeChannelPrefs(prefs[type]);
 
       if (!inApp) return;
 
       const notification = await this.prisma.notification.create({
-        data: { userId: user.id, type, title, message, data: data ?? {} },
+        data: { userId: user.id, type, title, message, data: data ?? {}, ...(deliverAfter ? { deliverAfter } : {}) },
       });
 
-      if (emailEnabled && user.email) {
+      if (!deliverAfter && emailEnabled && user.email) {
         await this.sendEmail(user.email, title, message, undefined, type, data);
         await this.prisma.notification.update({
           where: { id: notification.id },
@@ -103,13 +106,13 @@ export class NotificationsService {
         });
       }
 
-      if (slackEnabled && slackWebhookUrl) {
+      if (!deliverAfter && slackEnabled && slackWebhookUrl) {
         await this.sendSlackMessage(slackWebhookUrl, type, title, message, data);
       }
 
       this.gateway?.pushToUser(user.id, notification);
 
-      if (pushEnabled) {
+      if (!deliverAfter && pushEnabled) {
         this.webPush
           ?.sendToUser(user.id, type, title, message, data as Record<string, string> | undefined)
           .catch((err) => this.logger.error('Web push dispatch error', err.message));
@@ -144,16 +147,17 @@ export class NotificationsService {
       }
 
       const prefs = await this.getOrCreatePreferences(user.id);
+      const deliverAfter = type === NotificationType.SYSTEM_ALERT && data?.urgent === true ? null : this.getQuietHoursEnd(new Date(), (prefs as StoredPreferences)._quietHours);
       const { inApp } = prefs[type] ?? prefs[NotificationType.COMMENT_ADDED];
 
       if (!inApp) return;
 
       const notification = await this.prisma.notification.create({
-        data: { userId: user.id, type, title, message, data: data ?? {} },
+        data: { userId: user.id, type, title, message, data: { ...(data ?? {}), ...(deliverAfter ? { forceEmail: true } : {}) }, ...(deliverAfter ? { deliverAfter } : {}) },
       });
 
       // Force email delivery regardless of digest preference when the user has an email
-      if (user.email) {
+      if (user.email && !deliverAfter) {
         await this.sendEmail(user.email, title, message, undefined, type, data);
         await this.prisma.notification.update({
           where: { id: notification.id },
@@ -263,9 +267,20 @@ export class NotificationsService {
     };
   }
 
+  private validateQuietHours(q: any): void {
+    if (!q || typeof q.enabled !== 'boolean' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(q.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(q.end) || typeof q.timezone !== 'string') throw new BadRequestException('quietHours must contain enabled, HH:mm start/end, and an IANA timezone');
+    try { new Intl.DateTimeFormat('en-US', { timeZone: q.timezone }); } catch { throw new BadRequestException('quietHours.timezone must be a valid IANA timezone'); }
+  }
+
+  async isQuietHours(userId: string): Promise<boolean> {
+    const prefs = await this.getOrCreatePreferences(userId) as StoredPreferences;
+    return this.getQuietHoursEnd(new Date(), prefs._quietHours) !== null;
+  }
   async updatePreferences(userId: string, dto: UpdatePreferencesDto) {
+    if (dto.quietHours !== undefined) this.validateQuietHours(dto.quietHours);
     const current = (await this.getOrCreatePreferences(userId)) as StoredPreferences;
     const merged: StoredPreferences = { ...current, ...(dto.preferences ?? {}) };
+    if (dto.quietHours !== undefined) merged._quietHours = dto.quietHours;
     if (dto.digestFrequency) {
       merged._meta = { ...current._meta, digestFrequency: dto.digestFrequency };
     }
@@ -299,14 +314,50 @@ export class NotificationsService {
   async getPreferencesResponse(userId: string) {
     const { preferences, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(userId);
     const stored = preferences as StoredPreferences;
-    const { _meta, ...typePreferences } = stored;
+    const { _meta, _quietHours, ...typePreferences } = stored;
     return {
       ...typePreferences,
       digestFrequency: _meta?.digestFrequency ?? DEFAULT_DIGEST_FREQUENCY,
+      quietHours: _quietHours ?? { enabled: false, start: '22:00', end: '08:00', timezone: 'UTC' },
       slackWebhookUrl,
     };
   }
 
+  private getQuietHoursEnd(now: Date, q?: { enabled: boolean; start: string; end: string; timezone: string }): Date | null {
+    if (!q?.enabled) return null;
+    const local = new Intl.DateTimeFormat('en-GB', { timeZone: q.timezone, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(now);
+    const n = Number(local.find(x => x.type === 'hour')?.value) * 60 + Number(local.find(x => x.type === 'minute')?.value);
+    const [sh, sm] = q.start.split(':').map(Number); const [eh, em] = q.end.split(':').map(Number);
+    const start = sh * 60 + sm, end = eh * 60 + em;
+    const active = start === end || (start < end ? n >= start && n < end : n >= start || n < end);
+    if (!active) return null;
+    const date = new Intl.DateTimeFormat('en-CA', { timeZone: q.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(now);
+    const plusDay = start > end && n >= start;
+    const [y, mo, d] = date.split('-').map(Number);
+    const wall = Date.UTC(y, mo - 1, d + (plusDay ? 1 : 0), eh, em);
+    let utc = wall;
+    for (let i = 0; i < 2; i++) {
+      const parts: any = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: q.timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).formatToParts(new Date(utc)).map(x => [x.type, x.value]));
+      utc += wall - Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute);
+    }
+    return new Date(utc);
+  }
+
+  async deliverDeferredNotifications() {
+    const due = await this.prisma.notification.findMany({ where: { deliverAfter: { lte: new Date() } }, include: { user: { include: { notificationPreference: true } } }, take: 200, orderBy: { deliverAfter: 'asc' } });
+    for (const n of due) {
+      const pref = n.user.notificationPreference;
+      const channels = normalizeChannelPrefs(((pref?.preferences ?? {}) as StoredPreferences)[n.type]);
+      const forceEmail = (n.data as any)?.forceEmail === true;
+      if ((channels.email || forceEmail) && n.user.email && !n.emailSent) {
+        await this.sendEmail(n.user.email, n.title, n.message, undefined, n.type, n.data as any);
+        await this.prisma.notification.update({ where: { id: n.id }, data: { emailSent: true } });
+      }
+      if (channels.slack && pref?.slackWebhookUrl) await this.sendSlackMessage(pref.slackWebhookUrl, n.type, n.title, n.message, n.data as any);
+      if (channels.push) await this.webPush?.sendToUser(n.userId, n.type, n.title, n.message, n.data as any);
+      await this.prisma.notification.update({ where: { id: n.id }, data: { deliverAfter: null } });
+    }
+  }
   async findForUser(userId: string, unreadOnly = false, page = 1, limit = 20) {
     const where: any = { userId };
     if (unreadOnly) where.read = false;
@@ -482,11 +533,14 @@ export class NotificationsService {
         data?.milestoneIndex !== undefined ? String(data.milestoneIndex) : undefined;
 
       const fields = [
-        shipmentId ? { type: 'mrkdwn', text: `*Shipment:*\n\`${shipmentId}\`` } : null,
+        shipmentId ? { type: 'mrkdwn', text: `*Shipment:*
+\`${shipmentId}\`` } : null,
         milestoneIndex !== undefined
-          ? { type: 'mrkdwn', text: `*Milestone:*\n${milestoneIndex}` }
+          ? { type: 'mrkdwn', text: `*Milestone:*
+${milestoneIndex}` }
           : null,
-        { type: 'mrkdwn', text: `*Type:*\n${type}` },
+        { type: 'mrkdwn', text: `*Type:*
+${type}` },
       ].filter(Boolean);
 
       const payload = {

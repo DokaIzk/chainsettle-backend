@@ -620,6 +620,12 @@ export class ShipmentsController {
     return this.shipmentsService.arbiterAccept(id, user.stellarAddress);
   }
 
+  @Post(':id/arbiter/replace')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Replace a declined or pending shipment arbiter' })
+  replaceArbiter(@Param('id') id: string, @Body('arbiterAddress') arbiterAddress: string, @CurrentUser() user: any) {
+    return this.shipmentsService.replaceArbiter(id, user.stellarAddress, arbiterAddress);
+  }
   /**
    * POST /api/v1/shipments/:id/arbiter/decline
    */

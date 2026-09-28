@@ -12,6 +12,7 @@ import { IpfsService } from '../../common/ipfs/ipfs.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { ShipmentsService } from '../shipments/shipments.service';
 import { ShipmentApprovalsService } from '../shipments/shipment-approvals.service';
+import { MetricsService } from '../../common/metrics/metrics.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
 import { AppendMilestoneDto } from './dto/append-milestone.dto';
@@ -30,6 +31,7 @@ export class MilestonesService {
     private readonly auditLog: AuditLogService,
     private readonly stellar: StellarService,
     private readonly fxRate: FxRateService,
+    private readonly metrics: MetricsService,
   ) {}
 
   async findByShipment(shipmentId: string, status?: string, overdueOnly = false, precisionOverride?: number) {
@@ -475,7 +477,7 @@ export class MilestonesService {
 
     return this.prisma.milestone.update({
       where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
-      data: { status: MilestoneStatus.DISPUTED },
+      data: { status: MilestoneStatus.DISPUTED, disputedAt: new Date() },
     });
   }
 
@@ -488,6 +490,8 @@ export class MilestonesService {
     approved: boolean,
     paymentReleased?: bigint,
   ) {
+    const pending = await this.prisma.milestone.findUnique({ where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } } });
+    if (approved && pending?.status === MilestoneStatus.DISPUTED) this.metrics.observeDisputeResolutionTime((Date.now() - (pending.disputedAt ?? pending.createdAt).getTime()) / 3600000);
     return this.prisma.milestone.update({
       where: { shipmentId_milestoneIndex: { shipmentId, milestoneIndex } },
       data: {
