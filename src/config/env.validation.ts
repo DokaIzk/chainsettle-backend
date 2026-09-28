@@ -29,6 +29,9 @@ export const envValidationSchema = Joi.object({
   // Cold-storage archival of completed/cancelled shipments (days; default 90)
   SHIPMENT_ARCHIVAL_DAYS: Joi.number().integer().min(1).max(3650).default(90),
 
+  // Nightly deletion of read notifications older than this many days (default 90)
+  NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(1).max(3650).default(90),
+
   // Stellar
   STELLAR_NETWORK: Joi.string().valid('testnet', 'mainnet', 'futurenet').default('testnet'),
   STELLAR_RPC_URL: Joi.string().uri().required(),
@@ -76,6 +79,7 @@ export const envValidationSchema = Joi.object({
   // Webhooks
   WEBHOOK_DELIVERY_TIMEOUT_MS: Joi.number().integer().min(1000).max(600000).default(10000),
   WEBHOOK_MAX_PAYLOAD_BYTES: Joi.number().integer().min(1024).max(50 * 1024 * 1024).default(256 * 1024),
+  WEBHOOK_HEADERS_ENCRYPTION_KEY: Joi.string().length(32).default('change-me-webhook-headers-key!!!!'),
 
   // KYC/AML (#233)
   // Shipments with totalAmount (in stroops) at or above this threshold require

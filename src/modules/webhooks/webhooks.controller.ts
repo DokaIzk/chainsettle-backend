@@ -3,6 +3,7 @@ import {
   Post,
   Get,
   Delete,
+  Patch,
   Body,
   Param,
   Query,
@@ -20,9 +21,12 @@ import {
 } from '@nestjs/swagger';
 import { NotificationType } from '@prisma/client';
 import { WebhooksService } from './webhooks.service';
-import { CreateWebhookDto } from './dto/create-webhook.dto';
+import { CreateWebhookDto, ValidWebhookHeadersConstraint } from './dto/create-webhook.dto';
+import { UpdateWebhookDto } from './dto/update-webhook.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { useContainer } from 'class-validator';
+import { ModuleRef } from '@nestjs/core';
 
 // ── Response-shape documentation classes (Swagger only) ────────────────────
 
@@ -93,7 +97,12 @@ class DeliveryDetailDto {
 @UseGuards(JwtAuthGuard)
 @Controller('webhooks')
 export class WebhooksController {
-  constructor(private readonly webhooksService: WebhooksService) {}
+  constructor(
+    private readonly webhooksService: WebhooksService,
+    private readonly moduleRef: ModuleRef,
+  ) {
+    useContainer(moduleRef, { fallbackOnErrors: true });
+  }
 
   @Post()
   @ApiOperation({ summary: 'Register a webhook endpoint — returns plaintext secret once' })
@@ -136,6 +145,24 @@ export class WebhooksController {
   @ApiResponse({ status: 404, description: 'Webhook endpoint not found' })
   findOne(@Param('id') id: string, @CurrentUser('id') userId: string) {
     return this.webhooksService.findOneWithSummary(userId, id);
+  }
+
+  @Patch(':id')
+  @ApiOperation({
+    summary: 'Update a webhook endpoint (url, events, headers, active)',
+    description:
+      'Partial update. Only supplied fields are changed. Pass headers: {} to clear custom headers. ' +
+      'Values are encrypted at rest and masked in responses.',
+  })
+  @ApiResponse({ status: 200, description: 'Endpoint updated' })
+  @ApiResponse({ status: 400, description: 'Reserved header or validation error' })
+  @ApiResponse({ status: 404, description: 'Webhook endpoint not found' })
+  update(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @Body() dto: UpdateWebhookDto,
+  ) {
+    return this.webhooksService.update(userId, id, dto);
   }
 
   @Delete(':id')

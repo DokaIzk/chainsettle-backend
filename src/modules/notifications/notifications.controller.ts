@@ -1,17 +1,23 @@
-import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, NotFoundException } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, NotFoundException, HttpCode, HttpStatus } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { NotificationsService } from './notifications.service';
+import { WebPushService } from './web-push.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
+import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
+import { RegisterWebPushDto } from './dto/register-web-push.dto';
 
 @ApiTags('notifications')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
 @Controller('notifications')
 export class NotificationsController {
-  constructor(private readonly notificationsService: NotificationsService) {}
+  constructor(
+    private readonly notificationsService: NotificationsService,
+    private readonly webPushService: WebPushService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'Get notifications for the authenticated user' })
@@ -87,5 +93,29 @@ export class NotificationsController {
     const notification = await this.notificationsService.findOne(userId, id);
     if (!notification) throw new NotFoundException('Notification not found');
     return notification;
+  }
+
+  // ── Web Push ────────────────────────────────────────────────────────────────
+
+  @Public()
+  @Get('web-push/public-key')
+  @ApiOperation({ summary: 'Get the VAPID public key for web push subscription' })
+  getWebPushPublicKey() {
+    const key = this.webPushService.getPublicKey();
+    return { publicKey: key };
+  }
+
+  @Post('web-push/subscribe')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Register a browser push subscription for the authenticated user' })
+  subscribeWebPush(@CurrentUser('id') userId: string, @Body() dto: RegisterWebPushDto) {
+    return this.webPushService.subscribe(userId, dto);
+  }
+
+  @Delete('web-push/subscribe')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Remove a browser push subscription' })
+  unsubscribeWebPush(@CurrentUser('id') userId: string, @Body() dto: RegisterWebPushDto) {
+    return this.webPushService.unsubscribe(userId, dto.endpoint);
   }
 }
