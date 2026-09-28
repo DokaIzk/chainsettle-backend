@@ -53,6 +53,8 @@ enum NotificationType {
   ARBITER_DECLINED
   TRACKING_UPDATED
   PROOF_REJECTED
+  KYC_EXPIRING
+  KYC_EXPIRED
 }
 
 enum CommentVisibility {
@@ -96,6 +98,10 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  kycVerifiedAt    DateTime? // when the current KYC verification was granted (#429)
+  kycExpiresAt     DateTime? // verification lapses at this point and must be renewed (#429)
+  kycReminder30dSentAt DateTime? // 30-day re-verification reminder sent for the current kycExpiresAt
+  kycReminder7dSentAt  DateTime? // 7-day re-verification reminder sent for the current kycExpiresAt
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -120,6 +126,7 @@ model User {
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
 
+  @@index([kycExpiresAt])
   @@map("users")
 }
 
