@@ -5,6 +5,7 @@ import { NotificationsService } from './notifications.service';
 import { NotificationsController } from './notifications.controller';
 import { NotificationsGateway } from './notifications.gateway';
 import { NotificationDigestJob } from './notification-digest.job';
+import { NotificationCleanupJob } from './notification-cleanup.job';
 import { WebhooksModule } from '../webhooks/webhooks.module';
 import { PushNotificationService } from './push-notification.service';
 import { WebPushService } from './web-push.service';

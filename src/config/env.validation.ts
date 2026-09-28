@@ -29,6 +29,9 @@ export const envValidationSchema = Joi.object({
   // Cold-storage archival of completed/cancelled shipments (days; default 90)
   SHIPMENT_ARCHIVAL_DAYS: Joi.number().integer().min(1).max(3650).default(90),
 
+  // Nightly deletion of read notifications older than this many days (default 90)
+  NOTIFICATION_RETENTION_DAYS: Joi.number().integer().min(1).max(3650).default(90),
+
   // Stellar
   STELLAR_NETWORK: Joi.string().valid('testnet', 'mainnet', 'futurenet').default('testnet'),
   STELLAR_RPC_URL: Joi.string().uri().required(),
