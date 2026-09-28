@@ -74,8 +74,28 @@ function buildBody(eventType: string, payload: Record<string, unknown>): string 
   return JSON.stringify({ eventType, payload, timestamp: new Date().toISOString() });
 }
 
+/** Legacy v1 signature — kept for one deprecation cycle.
+ *  Signs only the raw JSON body. */
 function signBody(secret: string, body: string): string {
   return `sha256=${crypto.createHmac('sha256', secret).update(body).digest('hex')}`;
+}
+
+/**
+ * V2 signature — includes a unix-seconds timestamp so consumers can reject
+ * replayed deliveries older than their tolerance window (recommended: 300 s).
+ *
+ * Signed payload:  `${timestampSeconds}.${rawJsonBody}`
+ * Header format:   `t=<unix-seconds>,v1=<hex-digest>`
+ */
+function signBodyV2(secret: string, timestampSeconds: number, body: string): string {
+  const signedContent = `${timestampSeconds}.${body}`;
+  const digest = crypto.createHmac('sha256', secret).update(signedContent).digest('hex');
+  return `t=${timestampSeconds},v1=${digest}`;
+}
+
+/** Returns the current time as whole unix seconds. */
+function nowUnixSeconds(): number {
+  return Math.floor(Date.now() / 1_000);
 }
 
 // ─── Service ─────────────────────────────────────────────────────────────────
@@ -298,7 +318,9 @@ export class WebhooksService {
       delivery.payload as Record<string, unknown>,
     );
     const body = payloadCheck.body;
+    const ts = nowUnixSeconds();
     const signature = signBody(endpoint.secret, body);
+    const signatureV2 = signBodyV2(endpoint.secret, ts, body);
 
     if (payloadCheck.exceedsLimit) {
       await this.prisma.webhookDelivery.update({
@@ -322,7 +344,9 @@ export class WebhooksService {
       const res = await axios.post(endpoint.url, body, {
         headers: {
           'Content-Type': 'application/json',
+          'X-ChainSettle-Timestamp': String(ts),
           'X-ChainSettle-Signature': signature,
+          'X-ChainSettle-Signature-V2': signatureV2,
         },
         timeout: this.deliveryTimeoutMs,
       });
@@ -409,13 +433,17 @@ export class WebhooksService {
       };
     }
 
+    const ts = nowUnixSeconds();
     const signature = signBody(endpoint.secret, payloadCheck.body);
+    const signatureV2 = signBodyV2(endpoint.secret, ts, payloadCheck.body);
 
     try {
       const res = await axios.post(endpoint.url, payloadCheck.body, {
         headers: {
           'Content-Type': 'application/json',
+          'X-ChainSettle-Timestamp': String(ts),
           'X-ChainSettle-Signature': signature,
+          'X-ChainSettle-Signature-V2': signatureV2,
         },
         timeout: this.deliveryTimeoutMs,
       });
@@ -494,7 +522,9 @@ export class WebhooksService {
   ) {
     const payloadCheck = this.preparePayloadForDelivery(eventType, payload);
     const body = payloadCheck.body;
+    const ts = nowUnixSeconds();
     const signature = signBody(ep.secret, body);
+    const signatureV2 = signBodyV2(ep.secret, ts, body);
 
     const delivery = await this.prisma.webhookDelivery.create({
       data: {
@@ -526,7 +556,9 @@ export class WebhooksService {
       const res = await axios.post(ep.url, body, {
         headers: {
           'Content-Type': 'application/json',
+          'X-ChainSettle-Timestamp': String(ts),
           'X-ChainSettle-Signature': signature,
+          'X-ChainSettle-Signature-V2': signatureV2,
         },
         timeout: this.deliveryTimeoutMs,
       });
@@ -560,7 +592,9 @@ export class WebhooksService {
       delivery.payload as Record<string, unknown>,
     );
     const body = payloadCheck.body;
+    const ts = nowUnixSeconds();
     const signature = signBody(ep.secret, body);
+    const signatureV2 = signBodyV2(ep.secret, ts, body);
 
     // Bump attempt count immediately to avoid duplicate concurrent retries
     const updatedDelivery = await this.prisma.webhookDelivery.update({
@@ -592,7 +626,9 @@ export class WebhooksService {
       const res = await axios.post(ep.url, body, {
         headers: {
           'Content-Type': 'application/json',
+          'X-ChainSettle-Timestamp': String(ts),
           'X-ChainSettle-Signature': signature,
+          'X-ChainSettle-Signature-V2': signatureV2,
         },
         timeout: this.deliveryTimeoutMs,
       });

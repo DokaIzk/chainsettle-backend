@@ -1,9 +1,12 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import * as crypto from 'crypto';
+import axios from 'axios';
 import { WebhooksService } from './webhooks.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { AuditLogService } from '../audit-logs/audit-log.service';
 import { NotificationType } from '@prisma/client';
+
+jest.mock('axios');
 
 // ─── Factories ────────────────────────────────────────────────────────────────
 
@@ -79,7 +82,128 @@ describe('WebhooksService', () => {
     service = module.get(WebhooksService);
   });
 
-  afterEach(() => jest.clearAllMocks());
+  afterEach(() => {
+    jest.clearAllMocks();
+    jest.resetAllMocks();
+  });
+
+  // ── Signature header assertions ────────────────────────────────────────────
+
+  const LEGACY_SIG_RE = /^sha256=[a-f0-9]{64}$/;
+  const V2_SIG_RE = /^t=(\d+),v1=([a-f0-9]{64})$/;
+
+  function assertHeaders(headers: Record<string, string>, body: string, plaintextSecret: string) {
+    const tsHeader = headers['X-ChainSettle-Timestamp'];
+    const sigHeader = headers['X-ChainSettle-Signature'];
+    const sigV2Header = headers['X-ChainSettle-Signature-V2'];
+
+    expect(tsHeader).toBeDefined();
+    expect(Number.isInteger(Number(tsHeader))).toBe(true);
+    expect(Number(tsHeader)).toBeGreaterThan(0);
+
+    expect(sigHeader).toMatch(LEGACY_SIG_RE);
+    const expectedLegacy =
+      'sha256=' + crypto.createHmac('sha256', plaintextSecret).update(body).digest('hex');
+    expect(sigHeader).toBe(expectedLegacy);
+
+    const v2Match = V2_SIG_RE.exec(sigV2Header);
+    expect(v2Match).not.toBeNull();
+    const t = Number(v2Match![1]);
+    const v1 = v2Match![2];
+    expect(String(t)).toBe(tsHeader);
+    const expectedV1 = crypto
+      .createHmac('sha256', plaintextSecret)
+      .update(`${t}.${body}`)
+      .digest('hex');
+    expect(v1).toBe(expectedV1);
+
+    const now = Math.floor(Date.now() / 1000);
+    expect(Math.abs(now - t)).toBeLessThanOrEqual(5);
+  }
+
+  describe('dispatch (deliverOnce) — signature & timestamp headers', () => {
+    it('sends X-ChainSettle-Timestamp, legacy sig, and v2 sig with valid HMACs', async () => {
+      const plaintextSecret = 'plaintext-secret';
+      const ep = {
+        ...makeEndpoint('ep-1'),
+        secret: crypto.createHash('sha256').update(plaintextSecret).digest('hex'),
+      };
+      prisma.webhookEndpoint.findMany.mockResolvedValue([ep]);
+      prisma.webhookDelivery.create.mockResolvedValue(makeDelivery());
+
+      const axiosPost = axios.post as jest.MockedFunction<typeof axios.post>;
+      axiosPost.mockResolvedValue({ status: 200, data: 'ok' });
+
+      await service.dispatch(NotificationType.SHIPMENT_CREATED, { shipmentId: 'abc' });
+
+      expect(axiosPost).toHaveBeenCalledTimes(1);
+      const [, body, config] = axiosPost.mock.calls[0]!;
+      assertHeaders(config!.headers as Record<string, string>, body as string, plaintextSecret);
+    });
+  });
+
+  describe('retryDelivery — signature & timestamp headers', () => {
+    it('sends X-ChainSettle-Timestamp, legacy sig, and v2 sig with valid HMACs', async () => {
+      const plaintextSecret = 'plaintext-secret';
+      const ep = {
+        ...makeEndpoint('ep-1'),
+        secret: crypto.createHash('sha256').update(plaintextSecret).digest('hex'),
+      };
+      prisma.webhookDelivery.findFirst
+        .mockResolvedValueOnce(ep)
+        .mockResolvedValueOnce(makeDelivery());
+
+      const axiosPost = axios.post as jest.MockedFunction<typeof axios.post>;
+      axiosPost.mockResolvedValue({ status: 200, data: 'ok' });
+
+      await service.retryDelivery('ep-1', 'del-1', 'user-1');
+
+      expect(axiosPost).toHaveBeenCalledTimes(1);
+      const [, body, config] = axiosPost.mock.calls[0]!;
+      assertHeaders(config!.headers as Record<string, string>, body as string, plaintextSecret);
+    });
+  });
+
+  describe('processRetryQueue (executeRetry) — signature & timestamp headers', () => {
+    it('sends X-ChainSettle-Timestamp, legacy sig, and v2 sig with valid HMACs', async () => {
+      const plaintextSecret = 'plaintext-secret';
+      const ep = {
+        ...makeEndpoint('ep-1'),
+        secret: crypto.createHash('sha256').update(plaintextSecret).digest('hex'),
+      };
+      const due = [{ ...makeDelivery({ id: 'del-1', attemptCount: 2 }), endpoint: ep }];
+      prisma.webhookDelivery.findMany.mockResolvedValue(due);
+
+      const axiosPost = axios.post as jest.MockedFunction<typeof axios.post>;
+      axiosPost.mockResolvedValue({ status: 200, data: 'ok' });
+
+      await service.processRetryQueue();
+
+      expect(axiosPost).toHaveBeenCalledTimes(1);
+      const [, body, config] = axiosPost.mock.calls[0]!;
+      assertHeaders(config!.headers as Record<string, string>, body as string, plaintextSecret);
+    });
+  });
+
+  describe('bulkTest (sendTestPing) — signature & timestamp headers', () => {
+    it('sends X-ChainSettle-Timestamp, legacy sig, and v2 sig with valid HMACs', async () => {
+      const plaintextSecret = 'plaintext-secret';
+      const ep = {
+        ...makeEndpoint('ep-1'),
+        secret: crypto.createHash('sha256').update(plaintextSecret).digest('hex'),
+      };
+      prisma.webhookEndpoint.findMany.mockResolvedValue([ep]);
+
+      const axiosPost = axios.post as jest.MockedFunction<typeof axios.post>;
+      axiosPost.mockResolvedValue({ status: 200, data: 'ok' });
+
+      await service.bulkTest('user-1');
+
+      expect(axiosPost).toHaveBeenCalledTimes(1);
+      const [, body, config] = axiosPost.mock.calls[0]!;
+      assertHeaders(config!.headers as Record<string, string>, body as string, plaintextSecret);
+    });
+  });
 
   // ── HMAC signing ──────────────────────────────────────────────────────────
 
