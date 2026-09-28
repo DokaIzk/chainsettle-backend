@@ -16,6 +16,12 @@ import { StellarService } from '../../common/stellar/stellar.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
 import { AppendMilestoneDto } from './dto/append-milestone.dto';
 import { MilestoneStatus, NotificationType, DisputeRole, ArbiterStatus } from '@prisma/client';
+import { createHash } from 'crypto';
+
+/** Hex SHA-256 of a proof file's bytes (#394). */
+export function sha256Hex(buffer: Buffer): string {
+  return createHash('sha256').update(buffer).digest('hex');
+}
 
 @Injectable()
 export class MilestonesService {
@@ -44,7 +50,7 @@ export class MilestonesService {
       where.status = { notIn: [MilestoneStatus.CONFIRMED, MilestoneStatus.RESOLVED] };
     }
 
-    const [shipment, milestones] = await Promise.all([
+    const [shipment, milestones, commentCounts] = await Promise.all([
       this.prisma.shipment.findUnique({
         where: { id: shipmentId },
         select: { totalAmount: true, tokenDecimals: true, tokenSymbol: true },
@@ -53,6 +59,7 @@ export class MilestonesService {
         where,
         orderBy: { milestoneIndex: 'asc' },
       }),
+      this.countCommentsByMilestone(shipmentId),
     ]);
 
     // Estimated USD value (#231) — omitted per-milestone when no rate is
@@ -85,8 +92,32 @@ export class MilestonesService {
         ...m,
         isOverdue: m.dueAt ? m.dueAt < new Date() && m.status !== MilestoneStatus.CONFIRMED && m.status !== MilestoneStatus.RESOLVED : false,
         ...(estimatedUsdValue ? { estimatedUsdValue } : {}),
+        commentCount: commentCounts.get(m.milestoneIndex) ?? 0,
       };
     });
+  }
+
+  /** Live (non-deleted) comment counts per milestoneIndex for a shipment (#396). */
+  private async countCommentsByMilestone(shipmentId: string, milestoneIndex?: number) {
+    const rows = await this.prisma.shipmentComment.groupBy({
+      by: ['milestoneIndex'],
+      where: {
+        shipmentId,
+        deletedAt: null,
+        milestoneIndex: milestoneIndex ?? { not: null },
+      },
+      _count: { _all: true },
+    });
+    return new Map<number, number>(
+      rows.map((r) => [r.milestoneIndex as number, r._count._all]),
+    );
+  }
+
+  /** Single milestone plus its comment count, for the detail endpoint (#396). */
+  async findOneWithCommentCount(shipmentId: string, milestoneIndex: number) {
+    const milestone = await this.findOne(shipmentId, milestoneIndex);
+    const counts = await this.countCommentsByMilestone(shipmentId, milestoneIndex);
+    return { ...milestone, commentCount: counts.get(milestoneIndex) ?? 0 };
   }
 
   async findOne(shipmentId: string, milestoneIndex: number) {
@@ -202,6 +233,8 @@ export class MilestonesService {
         milestoneId: milestone.id,
         ipfsCid: cid,
         submittedBy: callerAddress,
+        sha256: sha256Hex(file.buffer),
+        fileSize: file.size ?? file.buffer.length,
       },
     });
 
@@ -1006,9 +1039,101 @@ export class MilestonesService {
     });
 
     return submissions.map((s) => ({
+      id: s.id,
       ipfsCid: s.ipfsCid,
       submittedBy: s.submittedBy,
+      sha256: s.sha256 ?? null,
+      fileSize: s.fileSize ?? null,
       createdAt: s.createdAt.toISOString(),
+    }));
+  }
+
+  /**
+   * Checks whether an uploaded file matches any stored proof for a milestone
+   * by SHA-256 (#394). Pre-migration submissions without a hash never match.
+   */
+  async verifyProof(shipmentId: string, milestoneIndex: number, file: Express.Multer.File) {
+    const milestone = await this.findOne(shipmentId, milestoneIndex);
+    const sha256 = sha256Hex(file.buffer);
+
+    const match = await this.prisma.proofSubmission.findFirst({
+      where: { milestoneId: milestone.id, sha256 },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    });
+
+    return match
+      ? { matches: true, submissionId: match.id, sha256 }
+      : { matches: false, sha256 };
+  }
+
+  /**
+   * Milestones due within the next `days` days across every ACTIVE shipment
+   * the user participates in (#395). With includeOverdue, milestones already
+   * past due are included and listed first.
+   */
+  async getUpcomingForUser(
+    callerAddress: string,
+    days = 14,
+    includeOverdue = false,
+  ) {
+    const now = new Date();
+    const until = new Date(now.getTime() + days * 24 * 60 * 60 * 1000);
+
+    const milestones = await this.prisma.milestone.findMany({
+      where: {
+        deletedAt: null,
+        status: { in: [MilestoneStatus.PENDING, MilestoneStatus.PROOF_SUBMITTED] },
+        dueAt: includeOverdue ? { not: null, lte: until } : { gte: now, lte: until },
+        shipment: {
+          // Archived shipments are moved out of this table; CANCELLED/COMPLETED are excluded here.
+          status: 'ACTIVE',
+          OR: [
+            { buyerAddress: callerAddress },
+            { supplierAddress: callerAddress },
+            { logisticsAddress: callerAddress },
+            { arbiterAddress: callerAddress },
+          ],
+        },
+      },
+      orderBy: { dueAt: 'asc' },
+      select: {
+        milestoneIndex: true,
+        name: true,
+        status: true,
+        dueAt: true,
+        shipment: {
+          select: {
+            id: true,
+            referenceNumber: true,
+            buyerAddress: true,
+            supplierAddress: true,
+            logisticsAddress: true,
+            arbiterAddress: true,
+          },
+        },
+      },
+    });
+
+    const roleOf = (s: (typeof milestones)[number]['shipment']) =>
+      s.buyerAddress === callerAddress
+        ? 'BUYER'
+        : s.supplierAddress === callerAddress
+          ? 'SUPPLIER'
+          : s.logisticsAddress === callerAddress
+            ? 'LOGISTICS'
+            : 'ARBITER';
+
+    // Already sorted by dueAt asc, so overdue items naturally come first.
+    return milestones.map((m) => ({
+      shipmentId: m.shipment.id,
+      shipmentReference: m.shipment.referenceNumber ?? null,
+      milestoneIndex: m.milestoneIndex,
+      milestoneName: m.name,
+      dueAt: m.dueAt!.toISOString(),
+      status: m.status,
+      callerRole: roleOf(m.shipment),
+      isOverdue: m.dueAt! < now,
     }));
   }
 

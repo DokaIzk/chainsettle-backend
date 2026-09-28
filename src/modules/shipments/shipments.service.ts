@@ -201,7 +201,24 @@ export class ShipmentsService {
     this.metrics.incrementShipmentsCreated();
     this.metrics.incrementActiveShipments();
     await this.invalidateUserCache(dto.buyerAddress);
-    return await this.serialize(shipment);
+
+    // Assigning an away arbiter is allowed but surfaced as a warning (#397).
+    const warnings = await this.arbiterAvailabilityWarnings(arbiterAddress);
+    const serialized = await this.serialize(shipment);
+    return warnings.length ? { ...serialized, warnings } : serialized;
+  }
+
+  /** Non-blocking warnings when the arbiter has marked themselves away (#397). */
+  async arbiterAvailabilityWarnings(arbiterAddress: string): Promise<string[]> {
+    const arbiter = await this.prisma.user.findUnique({
+      where: { stellarAddress: arbiterAddress },
+      select: { arbiterAwayUntil: true, awayMessage: true },
+    });
+    if (!arbiter?.arbiterAwayUntil || arbiter.arbiterAwayUntil <= new Date()) return [];
+    return [
+      `Arbiter ${arbiterAddress} is away until ${arbiter.arbiterAwayUntil.toISOString()}` +
+        (arbiter.awayMessage ? `: ${arbiter.awayMessage}` : ''),
+    ];
   }
 
   // ----------------------------------------------------------
@@ -1802,7 +1819,11 @@ export class ShipmentsService {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        milestones: {
+          where: { deletedAt: null },
+          orderBy: { milestoneIndex: 'asc' },
+          include: { proofSubmissions: { orderBy: { createdAt: 'desc' }, take: 1 } },
+        },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
       },
@@ -1850,7 +1871,8 @@ export class ShipmentsService {
           doc.text(
             `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
             (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : '') +
-            (m.proofHash ? ` — Proof: ${m.proofHash}` : ''),
+            (m.proofHash ? ` — Proof: ${m.proofHash}` : '') +
+            (m.proofSubmissions?.[0]?.sha256 ? ` — SHA-256: ${m.proofSubmissions[0].sha256}` : ''),
           );
         }
       }

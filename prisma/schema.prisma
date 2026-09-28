@@ -96,6 +96,8 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  arbiterAwayUntil DateTime? // arbiter is unavailable until this time (#397); null = available
+  awayMessage      String?   @db.VarChar(500) // optional note shown while the arbiter is away (#397)
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -198,6 +200,7 @@ model Milestone {
   proofSubmissions ProofSubmission[]
 
   @@unique([shipmentId, milestoneIndex])
+  @@index([dueAt])
   @@map("milestones")
 }
 
@@ -206,6 +209,8 @@ model ProofSubmission {
   milestoneId String
   ipfsCid     String   // IPFS CID of the uploaded proof
   submittedBy String   // Stellar address of whoever uploaded
+  sha256      String?  // hex SHA-256 of the uploaded file (#394); null for pre-migration rows
+  fileSize    Int?     // size in bytes of the uploaded file (#394)
   createdAt   DateTime @default(now())
 
   // Relations
@@ -213,6 +218,7 @@ model ProofSubmission {
 
   @@index([milestoneId])
   @@index([submittedBy])
+  @@index([sha256])
   @@map("proof_submissions")
 }
 
@@ -311,6 +317,7 @@ model ShipmentComment {
   attachmentCid String?
   pinnedAt      DateTime?         // set when pinned; null when unpinned (max 3 per shipment)
   parentCommentId String?         // set when this comment is a reply to another comment (#299)
+  milestoneIndex  Int?            // optional milestone this comment is scoped to (#396)
   createdAt     DateTime          @default(now())
   updatedAt     DateTime          @updatedAt
   deletedAt     DateTime?
@@ -323,6 +330,7 @@ model ShipmentComment {
   @@index([shipmentId])
   @@index([authorId])
   @@index([parentCommentId])
+  @@index([shipmentId, milestoneIndex])
   @@map("shipment_comments")
 }
 
