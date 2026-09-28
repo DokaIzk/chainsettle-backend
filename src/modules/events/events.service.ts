@@ -7,6 +7,7 @@ import { RedisService } from '../../common/redis/redis.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { MilestonesService } from '../milestones/milestones.service';
 import { NotificationsService } from '../notifications/notifications.service';
+import { NotificationsGateway } from '../notifications/notifications.gateway';
 import { ShipmentsService } from '../shipments/shipments.service';
 import { MetricsService } from '../../common/metrics/metrics.service';
 import { NotificationType } from '@prisma/client';
@@ -50,6 +51,7 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     private readonly stellar: StellarService,
     private readonly milestones: MilestonesService,
     private readonly notifications: NotificationsService,
+    private readonly gateway: NotificationsGateway,
     private readonly shipments: ShipmentsService,
     private readonly config: ConfigService,
     private readonly metrics: MetricsService,
@@ -268,6 +270,11 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     await this.saveRawEvent(eventName, event, payload);
     await this.executeHandler(eventName, payload, event);
     this.metrics.incrementEventsProcessed(eventName);
+
+    const shipmentId = this.extractShipmentId(payload);
+    if (shipmentId) {
+      this.gateway.pushToShipmentRoom(shipmentId, eventName, payload);
+    }
   }
 
   private async executeHandler(eventName: string, payload: any, meta: any) {
