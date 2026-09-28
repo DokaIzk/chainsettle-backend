@@ -82,7 +82,7 @@ export class KycService {
 
     await this.prisma.user.update({
       where: { id: userId },
-      data: { kycStatus: KycStatus.PENDING, kycReference: reference },
+      data: { kycStatus: KycStatus.PENDING, kycReference: reference, kycSubmittedAt: new Date() },
     });
 
     await this.auditLog.record({

@@ -11,7 +11,9 @@ import {
   SHIPMENTS_CREATED_COUNTER,
   ACTIVE_SHIPMENTS_GAUGE,
   SHIPMENTS_BY_STATUS_GAUGE,
+  BUILD_INFO_GAUGE,
 } from './metrics.service';
+import { resolveBuildInfo } from '../build-info';
 
 const logger = new Logger('MetricsModule');
 
@@ -34,6 +36,19 @@ export async function collectShipmentsByStatus(this: Gauge<string>, prisma: Pris
   } catch (err) {
     logger.warn(`Failed to refresh ${SHIPMENTS_BY_STATUS_GAUGE}: ${err.message}`);
   }
+}
+
+/**
+ * Sets chainsettle_build_info{version,gitSha,buildTime,nodeVersion} = 1 on every
+ * scrape (#427), the standard Prometheus "info" pattern for joining on version.
+ */
+export function collectBuildInfo(this: Gauge<string>) {
+  const info = resolveBuildInfo();
+  this.reset();
+  this.set(
+    { version: info.version, gitSha: info.gitSha, buildTime: info.buildTime, nodeVersion: info.nodeVersion },
+    1,
+  );
 }
 
 @Global()
@@ -68,6 +83,12 @@ export async function collectShipmentsByStatus(this: Gauge<string>, prisma: Pris
       labelNames: ['status'],
       inject: [PrismaService],
       collect: collectShipmentsByStatus,
+    }),
+    makeGaugeProvider({
+      name: BUILD_INFO_GAUGE,
+      help: 'Build information for the running instance; value is always 1',
+      labelNames: ['version', 'gitSha', 'buildTime', 'nodeVersion'],
+      collect: collectBuildInfo,
     }),
     MetricsService,
   ],

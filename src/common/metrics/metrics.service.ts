@@ -7,6 +7,7 @@ export const EVENTS_FAILED_COUNTER = 'chainsettle_events_failed_total';
 export const SHIPMENTS_CREATED_COUNTER = 'chainsettle_shipments_created_total';
 export const ACTIVE_SHIPMENTS_GAUGE = 'chainsettle_active_shipments';
 export const SHIPMENTS_BY_STATUS_GAUGE = 'chainsettle_shipments_by_status';
+export const BUILD_INFO_GAUGE = 'chainsettle_build_info';
 
 @Injectable()
 export class MetricsService {

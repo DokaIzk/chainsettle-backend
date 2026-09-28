@@ -96,6 +96,10 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  kycSubmittedAt   DateTime? // when the current KYC case entered PENDING; orders the manual review queue (#428)
+  organization     String?   // shown in the public arbiter directory (#398)
+  listedInDirectory Boolean  @default(true) // arbiters can opt out of GET /arbiters (#398)
+  arbiterAvailable Boolean   @default(true) // arbiter is accepting new cases (#398)
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -119,8 +123,50 @@ model User {
   shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
+  announcementDismissals AnnouncementDismissal[]
 
+  @@index([role, listedInDirectory])
+  @@index([kycStatus, kycSubmittedAt])
   @@map("users")
+}
+
+enum AnnouncementSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+/// Admin-managed platform banner (#426). Shown while startsAt <= now < endsAt
+/// to users whose role is in audienceRoles (empty = everyone).
+model Announcement {
+  id            String               @id @default(uuid())
+  title         String
+  body          String
+  severity      AnnouncementSeverity @default(INFO)
+  startsAt      DateTime
+  endsAt        DateTime?
+  audienceRoles UserRole[]           @default([])
+  createdById   String?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  dismissals AnnouncementDismissal[]
+
+  @@index([startsAt, endsAt])
+  @@map("announcements")
+}
+
+model AnnouncementDismissal {
+  announcementId String
+  userId         String
+  dismissedAt    DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([announcementId, userId])
+  @@index([userId])
+  @@map("announcement_dismissals")
 }
 
 model Shipment {
