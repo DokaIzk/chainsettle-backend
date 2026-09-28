@@ -41,6 +41,8 @@ export const envValidationSchema = Joi.object({
   STELLAR_SECRET_KEY: Joi.string().required(),
 
   // Email
+  EMAIL_WEBHOOK_SECRET: Joi.string().optional(),
+  MAX_JSON_DEPTH: Joi.number().integer().min(1).default(20),
   SMTP_HOST: Joi.string().required(),
   SMTP_PORT: Joi.number().integer().min(1).max(65535).default(587),
   SMTP_USER: Joi.string().required(),

@@ -119,6 +119,8 @@ model User {
   shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
+  organizationMemberships OrganizationMember[]
+  createdOrganizations    Organization[]       @relation("OrganizationCreator")
 
   @@map("users")
 }
@@ -614,4 +616,60 @@ model ArchivedShipment {
   @@index([archivedAt])
   @@index([terminalAt])
   @@map("archived_shipments")
+}
+// ============================================================
+// EMAIL SUPPRESSION (#434)
+// ============================================================
+
+enum EmailSuppressionReason {
+  BOUNCE
+  COMPLAINT
+}
+
+model EmailSuppression {
+  id        String                 @id @default(uuid())
+  email     String                 @unique // stored lower-cased
+  reason    EmailSuppressionReason
+  createdAt DateTime               @default(now())
+
+  @@map("email_suppressions")
+}
+
+// ============================================================
+// ORGANIZATIONS (#435)
+// ============================================================
+
+enum OrganizationRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  createdBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creator User                 @relation("OrganizationCreator", fields: [createdBy], references: [id])
+  members OrganizationMember[]
+
+  @@map("organizations")
+}
+
+model OrganizationMember {
+  id        String           @id @default(uuid())
+  orgId     String
+  userId    String
+  role      OrganizationRole @default(MEMBER)
+  createdAt DateTime         @default(now())
+
+  organization Organization @relation(fields: [orgId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([orgId, userId])
+  @@index([userId])
+  @@map("organization_members")
 }

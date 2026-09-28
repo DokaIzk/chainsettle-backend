@@ -12,6 +12,7 @@ import helmet from 'helmet';
 import * as compression from 'compression';
 import { IoAdapter } from '@nestjs/platform-socket.io';
 import { AppModule } from './app.module';
+import { createBodyLimitMiddleware } from './common/middleware/body-limit.middleware';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
 import { createWinstonLogger } from './common/logger/winston.logger';
 import * as fs from 'fs';
@@ -31,8 +32,20 @@ async function bootstrap() {
     );
   });
 
-  const app = await NestFactory.create(AppModule, { logger: winstonLogger });
+  const app = await NestFactory.create(AppModule, {
+    logger: winstonLogger,
+    // Body parsing is handled by createBodyLimitMiddleware (per-route limits, #433)
+    bodyParser: false,
+  });
   const logger = winstonLogger;
+
+  // 100 KB JSON default, larger limits only for routes in BODY_LIMIT_ROUTES,
+  // JSON nesting depth guard, 413 in the standard error format (#433).
+  app.use(
+    createBodyLimitMiddleware({
+      maxDepth: Number(process.env.MAX_JSON_DEPTH ?? 20),
+    }),
+  );
 
   // Use Socket.io adapter for WebSocket gateways
   app.useWebSocketAdapter(new IoAdapter(app));

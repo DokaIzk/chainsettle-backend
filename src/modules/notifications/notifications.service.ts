@@ -96,8 +96,8 @@ export class NotificationsService {
       });
 
       if (emailEnabled && user.email) {
-        await this.sendEmail(user.email, title, message, undefined, type, data);
-        await this.prisma.notification.update({
+        const sent = await this.sendEmail(user.email, title, message, undefined, type, data);
+        if (sent) await this.prisma.notification.update({
           where: { id: notification.id },
           data: { emailSent: true },
         });
@@ -124,6 +124,9 @@ export class NotificationsService {
       this.logger.error(`Failed to notify ${stellarAddress}`, error.message);
     }
   }
+
+  /**
+   * Like notify(), but always delivers email regardless of the user's digest
    * preference. Used for high-signal events such as direct @mentions (#190).
    */
   async notifyUserWithForcedEmail(
@@ -154,8 +157,8 @@ export class NotificationsService {
 
       // Force email delivery regardless of digest preference when the user has an email
       if (user.email) {
-        await this.sendEmail(user.email, title, message, undefined, type, data);
-        await this.prisma.notification.update({
+        const sent = await this.sendEmail(user.email, title, message, undefined, type, data);
+        if (sent) await this.prisma.notification.update({
           where: { id: notification.id },
           data: { emailSent: true },
         });
@@ -432,7 +435,12 @@ export class NotificationsService {
     type?: NotificationType,
     data?: Record<string, any>,
     locale: string = DEFAULT_LOCALE,
-  ) {
+  ): Promise<boolean> {
+    // Never send to addresses that hard-bounced or complained (#434).
+    if (await this.isEmailSuppressed(to)) {
+      this.logger.warn(`Email to ${to} skipped — address is on the suppression list`);
+      return false;
+    }
     try {
       let renderedHtml = html;
       if (!renderedHtml && type) {
@@ -460,8 +468,25 @@ export class NotificationsService {
         `,
       });
       this.logger.log(`Email sent to ${to}: ${localizedSubject}`);
+      return true;
     } catch (error) {
       this.logger.error(`Email failed to ${to}`, error.message);
+      return false;
+    }
+  }
+
+  /** True when the address is on the bounce/complaint suppression list (#434). */
+  async isEmailSuppressed(email: string): Promise<boolean> {
+    try {
+      const hit = await this.prisma.emailSuppression.findUnique({
+        where: { email: email.trim().toLowerCase() },
+        select: { id: true },
+      });
+      return !!hit;
+    } catch (error) {
+      // Fail closed: if we can't check the list, don't risk hurting sender reputation.
+      this.logger.error(`Suppression lookup failed for ${email}`, error.message);
+      return true;
     }
   }
 
