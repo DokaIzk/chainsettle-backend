@@ -124,6 +124,9 @@ export class NotificationsService {
       this.logger.error(`Failed to notify ${stellarAddress}`, error.message);
     }
   }
+
+  /**
+   * Sends a notification that always attempts email regardless of the email
    * preference. Used for high-signal events such as direct @mentions (#190).
    */
   async notifyUserWithForcedEmail(

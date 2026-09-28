@@ -21,6 +21,7 @@ import { FxModule } from './common/fx/fx.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
 import { ShipmentTemplatesModule } from './modules/shipment-templates/shipment-templates.module';
+import { RecurringSchedulesModule } from './modules/recurring-schedules/recurring-schedules.module';
 import { MilestonesModule } from './modules/milestones/milestones.module';
 import { EventsModule } from './modules/events/events.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -81,6 +82,7 @@ import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.
     AuthModule,
     ShipmentsModule,
     ShipmentTemplatesModule,
+    RecurringSchedulesModule,
     MilestonesModule,
     EventsModule,
     NotificationsModule,
