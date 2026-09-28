@@ -115,6 +115,7 @@ model User {
   apiKeys     ApiKey[]
   deviceTokens DeviceToken[]
   notificationPreference NotificationPreference?
+  webPushSubscriptions   WebPushSubscription[]
   shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
@@ -489,6 +490,20 @@ model ApiKey {
   @@index([expiresAt])
   @@index([gracePeriodEndsAt])
   @@map("api_keys")
+}
+
+model WebPushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  endpoint  String   @unique // push service URL (acts as the device identity)
+  p256dh    String   // client public key (base64url)
+  auth      String   // auth secret (base64url)
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("web_push_subscriptions")
 }
 
 model DeviceToken {
