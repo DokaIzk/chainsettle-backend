@@ -4,6 +4,7 @@ import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as Handlebars from 'handlebars';
+import { WebPushService } from './web-push.service';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationType } from '@prisma/client';
 import { NotificationsGateway } from './notifications.gateway';
@@ -12,7 +13,7 @@ import { PushNotificationService } from './push-notification.service';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { DEFAULT_LOCALE, I18nService } from '../../i18n/i18n.service';
 
-type ChannelPrefs = { inApp: boolean; email: boolean; slack?: boolean };
+type ChannelPrefs = { inApp: boolean; email: boolean; slack?: boolean; push?: boolean };
 type PreferenceMap = Record<NotificationType, ChannelPrefs>;
 export type DigestFrequency = 'instant' | 'daily' | 'weekly';
 type StoredPreferences = PreferenceMap & {
@@ -23,7 +24,7 @@ const DEFAULT_DIGEST_FREQUENCY: DigestFrequency = 'daily';
 
 function buildDefaultPreferences(): PreferenceMap {
   return Object.values(NotificationType).reduce((acc, type) => {
-    acc[type] = { inApp: true, email: true, slack: true };
+    acc[type] = { inApp: true, email: true, slack: true, push: true };
     return acc;
   }, {} as PreferenceMap);
 }
@@ -33,6 +34,7 @@ function normalizeChannelPrefs(raw: Partial<ChannelPrefs> | undefined): ChannelP
     inApp: raw?.inApp ?? true,
     email: raw?.email ?? true,
     slack: raw?.slack ?? true,
+    push: raw?.push ?? true,
   };
 }
 
@@ -47,6 +49,7 @@ export class NotificationsService {
     private readonly i18n: I18nService,
     @Optional() private readonly gateway: NotificationsGateway,
     @Optional() private readonly webhooks: WebhooksService,
+    @Optional() private readonly webPush: WebPushService,
   ) {
     this.transporter = nodemailer.createTransport({
       host: this.config.get('SMTP_HOST'),
@@ -84,7 +87,7 @@ export class NotificationsService {
       }
 
       const { preferences: prefs, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
-      const { inApp, email: emailEnabled, slack: slackEnabled } = normalizeChannelPrefs(prefs[type]);
+      const { inApp, email: emailEnabled, slack: slackEnabled, push: pushEnabled } = normalizeChannelPrefs(prefs[type]);
 
       if (!inApp) return;
 
@@ -106,6 +109,12 @@ export class NotificationsService {
 
       this.gateway?.pushToUser(user.id, notification);
 
+      if (pushEnabled) {
+        this.webPush
+          ?.sendToUser(user.id, type, title, message, data as Record<string, string> | undefined)
+          .catch((err) => this.logger.error('Web push dispatch error', err.message));
+      }
+
       this.webhooks
         ?.dispatch(type, { notificationId: notification.id, ...(data ?? {}) })
         .catch((err) => this.logger.error('Webhook dispatch error', err.message));
@@ -115,9 +124,6 @@ export class NotificationsService {
       this.logger.error(`Failed to notify ${stellarAddress}`, error.message);
     }
   }
-
-  /**
-   * Like notifyUser() but always sends an email regardless of the user's digest
    * preference. Used for high-signal events such as direct @mentions (#190).
    */
   async notifyUserWithForcedEmail(
