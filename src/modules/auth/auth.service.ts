@@ -129,6 +129,8 @@ export class AuthService {
         name: true,
         email: true,
         role: true,
+        organizationName: true,
+        countryCode: true,
         deactivatedAt: true,
         createdAt: true,
       },
@@ -321,6 +323,8 @@ export class AuthService {
         pendingEmail: true,
         name: true,
         role: true,
+        organizationName: true,
+        countryCode: true,
         deactivatedAt: true,
         createdAt: true,
         updatedAt: true,
@@ -372,6 +376,8 @@ export class AuthService {
         emailVerified: true,
         name: true,
         role: true,
+        organizationName: true,
+        countryCode: true,
         kycStatus: true,
         createdAt: true,
         updatedAt: true,
@@ -440,7 +446,7 @@ export class AuthService {
   async getPublicProfile(stellarAddress: string) {
     const user = await this.prisma.user.findUnique({
       where: { stellarAddress },
-      select: { stellarAddress: true, name: true, role: true, createdAt: true },
+      select: { stellarAddress: true, name: true, role: true, organizationName: true, countryCode: true, createdAt: true },
     });
     if (!user) throw new NotFoundException('User not found');
     return user;
@@ -543,6 +549,14 @@ export class AuthService {
 
     if (dto.name !== undefined) {
       updateData.name = dto.name;
+    }
+
+    if (dto.organizationName !== undefined) {
+      updateData.organizationName = dto.organizationName || null;
+    }
+
+    if (dto.countryCode !== undefined) {
+      updateData.countryCode = dto.countryCode || null;
     }
 
     if (dto.email !== undefined && dto.email !== user.email) {

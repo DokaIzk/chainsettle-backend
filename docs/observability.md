@@ -24,6 +24,15 @@ Defined in `src/common/metrics/metrics.service.ts` and registered in
 | `chainsettle_active_shipments` | Gauge | — | Current count of ACTIVE shipments |
 | `chainsettle_http_request_duration_seconds` | Histogram | `method`, `route`, `status` | Per-route HTTP latency (buckets: 5 ms → 5 s) |
 
+### Dead-letter queue (DLQ)
+
+`chainsettle_events_failed_total` increments every time an on-chain event cannot be processed
+and is moved to the `failed_events` table. A sustained rise in this counter warrants
+investigation.
+
+For the full triage and retry procedure, see the
+[Failed Events runbook](runbooks/failed-events.md).
+
 ### Default Node.js metrics
 
 `PrometheusModule` is initialised with `defaultMetrics: { enabled: true }`, so all standard

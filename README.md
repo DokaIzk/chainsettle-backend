@@ -255,6 +255,8 @@ npm run start:dev
 API available at: `http://localhost:3000/api/v1`
 Swagger docs at: `http://localhost:3000/docs`
 
+> **Hitting an error?** See [docs/troubleshooting.md](docs/troubleshooting.md) for solutions to the most common setup and runtime problems (missing env vars, Prisma client not generated, Redis/Stellar/IPFS unreachable, port conflicts).
+
 ---
 
 ## API Versioning
@@ -316,7 +318,10 @@ npm run generate:sdk   # refresh openapi.json + schema.ts
 npm run check:sdk      # CI: fail if sdk/ is stale
 ```
 
-See [sdk/README.md](./sdk/README.md).
+For a full usage guide — client construction, authentication, pagination, error handling,
+and how to fix a failing drift check — see **[docs/sdk.md](docs/sdk.md)**.
+
+See also [sdk/README.md](./sdk/README.md) for a quick-start.
 
 ---
 

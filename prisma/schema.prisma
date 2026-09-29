@@ -104,9 +104,15 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  kycVerifiedAt    DateTime? // when KYC was last approved
+  kycExpiresAt     DateTime? // when the current KYC approval expires (null = no expiry set)
+  kycReminder30dSentAt DateTime? // tracks whether the 30-day expiry reminder was sent
+  kycReminder7dSentAt  DateTime? // tracks whether the 7-day expiry reminder was sent
   phoneNumber      String?   // E.164 format (e.g., +14155551234)
   phoneVerified    Boolean   @default(false)
   pendingPhone     String?   // pending verification change
+  organizationName String?   @db.VarChar(200) // legal entity or trading name, max 200 chars
+  countryCode      String?   @db.Char(2)      // ISO 3166-1 alpha-2 (e.g., "US", "DE")
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
