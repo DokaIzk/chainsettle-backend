@@ -92,7 +92,7 @@ export class CommentsService {
         parentCommentId: dto.parentCommentId ?? null,
         milestoneIndex: dto.milestoneIndex ?? null,
       },
-      include: { author: { select: { id: true, stellarAddress: true, name: true } } },
+      include: { author: { select: { id: true, stellarAddress: true, name: true, avatarCid: true } } },
     });
 
     this.logger.log(`Comment created on shipment ${shipmentId} by ${authorAddress}`);
@@ -108,7 +108,7 @@ export class CommentsService {
       authorAddress,
     );
 
-    return { ...comment, mentionedAddresses };
+    return { ...comment, author: this.formatAuthor(comment.author), mentionedAddresses };
   }
 
   // ----------------------------------------------------------
@@ -148,7 +148,7 @@ export class CommentsService {
       this.prisma.shipmentComment.findMany({
         where,
         include: {
-          author: { select: { id: true, stellarAddress: true, name: true } },
+          author: { select: { id: true, stellarAddress: true, name: true, avatarCid: true } },
           _count: { select: { replies: { where: visibleReplies } } },
         },
         orderBy: [
@@ -164,6 +164,7 @@ export class CommentsService {
 
     const data = comments.map(({ _count, ...comment }) => ({
       ...this.redactIfDeleted(comment),
+      author: this.formatAuthor(comment.author),
       replyCount: _count.replies,
     }));
 
@@ -199,7 +200,7 @@ export class CommentsService {
     const [replies, total] = await this.prisma.$transaction([
       this.prisma.shipmentComment.findMany({
         where,
-        include: { author: { select: { id: true, stellarAddress: true, name: true } } },
+        include: { author: { select: { id: true, stellarAddress: true, name: true, avatarCid: true } } },
         orderBy: { createdAt: 'asc' },
         skip: (page - 1) * limit,
         take: limit,
@@ -207,7 +208,12 @@ export class CommentsService {
       this.prisma.shipmentComment.count({ where }),
     ]);
 
-    return { data: replies, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
+    const data = replies.map((reply) => ({
+      ...this.redactIfDeleted(reply),
+      author: this.formatAuthor(reply.author),
+    }));
+
+    return { data, meta: { total, page, limit, totalPages: Math.ceil(total / limit) } };
   }
 
   // ----------------------------------------------------------
@@ -247,14 +253,14 @@ export class CommentsService {
     const updated = await this.prisma.shipmentComment.update({
       where: { id: commentId },
       data: { pinnedAt: pinned ? new Date() : null },
-      include: { author: { select: { id: true, stellarAddress: true, name: true } } },
+      include: { author: { select: { id: true, stellarAddress: true, name: true, avatarCid: true } } },
     });
 
     this.logger.log(
       `Comment ${commentId} ${pinned ? 'pinned' : 'unpinned'} by ${requesterAddress}`,
     );
 
-    return updated;
+    return { ...updated, author: this.formatAuthor(updated.author) };
   }
 
   // ----------------------------------------------------------
@@ -309,6 +315,14 @@ export class CommentsService {
     }
 
     return { shipment, isAdmin };
+  }
+
+  private formatAuthor(author: any) {
+    if (!author) return author;
+    return {
+      ...author,
+      avatarUrl: author.avatarCid ? `/api/v1/ipfs/${author.avatarCid}` : null,
+    };
   }
 
   private redactIfDeleted<T extends { deletedAt: Date | null }>(comment: T) {

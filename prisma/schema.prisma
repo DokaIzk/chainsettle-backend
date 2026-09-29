@@ -111,6 +111,7 @@ model User {
   phoneNumber      String?   // E.164 format (e.g., +14155551234)
   phoneVerified    Boolean   @default(false)
   pendingPhone     String?   // pending verification change
+  avatarCid        String?   // IPFS CID of the user's profile avatar
   /// Preferred display currency for converted shipment values.
   /// Validated against SUPPORTED_CURRENCIES in FxRateService.
   /// Defaults to 'USD' so existing users see no behaviour change.

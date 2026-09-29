@@ -12,8 +12,10 @@ import { UsersController } from "./users.controller";
 import { SessionService } from "./session.service";
 import { NotificationsModule } from "../notifications/notifications.module";
 import { AuditLogsModule } from "../audit-logs/audit-logs.module";
+import { IpfsModule } from "../../common/ipfs/ipfs.module";
 import { ContactsController } from "./contacts.controller";
 import { ContactsService } from "./contacts.service";
+import { AdminUsersController } from "./admin-users.controller";
 
 @Module({
   imports: [
@@ -28,12 +30,14 @@ import { ContactsService } from "./contacts.service";
     }),
     NotificationsModule,
     AuditLogsModule,
+    IpfsModule,
   ],
   controllers: [
     AuthController,
     ApiKeysController,
     UsersController,
     ContactsController,
+    AdminUsersController,
   ],
   providers: [
     AuthService,
