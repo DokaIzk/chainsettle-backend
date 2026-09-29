@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, Logger, Optional } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
@@ -390,6 +390,9 @@ export class NotificationsService {
   ) {
     const where: any = { userId };
     if (unreadOnly) where.read = false;
+    // Exclude notifications that are actively snoozed (snoozedUntil is in the future).
+    // Once the snooze time passes the row reappears automatically — no cron needed.
+    where.OR = [{ snoozedUntil: null }, { snoozedUntil: { lt: new Date() } }];
 
     if (groupBy === 'shipment') {
       const notifications = await this.prisma.notification.findMany({
@@ -478,6 +481,33 @@ export class NotificationsService {
 
   async findOne(userId: string, id: string) {
     return this.prisma.notification.findFirst({ where: { id, userId } });
+  }
+
+  async snooze(userId: string, id: string, until: string): Promise<void> {
+    const snoozedUntil = new Date(until);
+    if (snoozedUntil <= new Date()) {
+      throw new BadRequestException('Snooze time must be in the future');
+    }
+
+    const result = await this.prisma.notification.updateMany({
+      where: { id, userId },
+      data: { snoozedUntil },
+    });
+
+    if (result.count === 0) {
+      throw new NotFoundException('Notification not found');
+    }
+  }
+
+  async unsnooze(userId: string, id: string): Promise<void> {
+    const result = await this.prisma.notification.updateMany({
+      where: { id, userId },
+      data: { snoozedUntil: null },
+    });
+
+    if (result.count === 0) {
+      throw new NotFoundException('Notification not found');
+    }
   }
 
   async markRead(notificationId: string, userId: string) {

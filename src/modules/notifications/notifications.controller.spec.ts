@@ -18,6 +18,8 @@ describe('NotificationsController', () => {
       updatePreferences: jest.fn(),
       sendTestNotification: jest.fn(),
       findOne: jest.fn(),
+      snooze: jest.fn(),
+      unsnooze: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -56,6 +58,58 @@ describe('NotificationsController', () => {
       const result = await controller.getDigestPreview(userId);
       expect(notificationsService.buildDigest).toHaveBeenCalledWith(userId);
       expect(result).toEqual({ subject: '', html: '' });
+    });
+  });
+
+  describe('snooze', () => {
+    const userId = 'user-123';
+    const notifId = 'notif-abc';
+    const until = '2099-01-01T09:00:00.000Z';
+
+    it('calls service.snooze with the correct args and returns nothing (204)', async () => {
+      notificationsService.snooze.mockResolvedValue(undefined);
+
+      const result = await controller.snooze(notifId, userId, { until });
+
+      expect(notificationsService.snooze).toHaveBeenCalledWith(userId, notifId, until);
+      expect(result).toBeUndefined();
+    });
+
+    it('propagates NotFoundException from the service', async () => {
+      const { NotFoundException } = await import('@nestjs/common');
+      notificationsService.snooze.mockRejectedValue(new NotFoundException('Notification not found'));
+
+      await expect(controller.snooze(notifId, userId, { until })).rejects.toThrow('Notification not found');
+    });
+
+    it('propagates BadRequestException when the service rejects a past date', async () => {
+      const { BadRequestException } = await import('@nestjs/common');
+      notificationsService.snooze.mockRejectedValue(new BadRequestException('Snooze time must be in the future'));
+
+      await expect(controller.snooze(notifId, userId, { until: '2000-01-01T00:00:00.000Z' })).rejects.toThrow(
+        'Snooze time must be in the future',
+      );
+    });
+  });
+
+  describe('unsnooze', () => {
+    const userId = 'user-123';
+    const notifId = 'notif-abc';
+
+    it('calls service.unsnooze with the correct args and returns nothing (204)', async () => {
+      notificationsService.unsnooze.mockResolvedValue(undefined);
+
+      const result = await controller.unsnooze(notifId, userId);
+
+      expect(notificationsService.unsnooze).toHaveBeenCalledWith(userId, notifId);
+      expect(result).toBeUndefined();
+    });
+
+    it('propagates NotFoundException from the service', async () => {
+      const { NotFoundException } = await import('@nestjs/common');
+      notificationsService.unsnooze.mockRejectedValue(new NotFoundException('Notification not found'));
+
+      await expect(controller.unsnooze(notifId, userId)).rejects.toThrow('Notification not found');
     });
   });
 });

@@ -1,4 +1,4 @@
-import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, NotFoundException, HttpCode, HttpStatus } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Delete, Param, Query, Body, UseGuards, NotFoundException, HttpCode, HttpStatus, BadRequestException } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiBearerAuth, ApiQuery } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
 import { NotificationsService } from './notifications.service';
@@ -8,6 +8,7 @@ import { Public } from '../../common/decorators/public.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { UpdatePreferencesDto } from './dto/update-preferences.dto';
 import { RegisterWebPushDto } from './dto/register-web-push.dto';
+import { SnoozeNotificationDto } from './dto/snooze-notification.dto';
 
 @ApiTags('notifications')
 @ApiBearerAuth()
@@ -87,6 +88,40 @@ export class NotificationsController {
     return digest || { subject: '', html: '' };
   }
 
+  // ── Snooze ─────────────────────────────────────────────────────────────────
+
+  @Post(':id/snooze')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Snooze a notification until a given time',
+    description:
+      'Hides the notification from the default GET /notifications list until `until` passes. ' +
+      'Once the snooze expires the notification reappears automatically as unread — ' +
+      'the read/unread state is never changed by snoozing.',
+  })
+  async snooze(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+    @Body() dto: SnoozeNotificationDto,
+  ): Promise<void> {
+    await this.notificationsService.snooze(userId, id, dto.until);
+  }
+
+  @Delete(':id/snooze')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: 'Cancel a snooze early',
+    description: 'Clears the snoozedUntil timestamp so the notification reappears immediately.',
+  })
+  async unsnooze(
+    @Param('id') id: string,
+    @CurrentUser('id') userId: string,
+  ): Promise<void> {
+    await this.notificationsService.unsnooze(userId, id);
+  }
+
+  // ── Single notification ─────────────────────────────────────────────────────
+
   @Get(':id')
   @ApiOperation({ summary: 'Fetch a single notification by ID' })
   async findOne(@Param('id') id: string, @CurrentUser('id') userId: string) {
@@ -94,7 +129,6 @@ export class NotificationsController {
     if (!notification) throw new NotFoundException('Notification not found');
     return notification;
   }
-
   // ── Web Push ────────────────────────────────────────────────────────────────
 
   @Public()

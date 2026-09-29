@@ -71,6 +71,10 @@ The backend is the **bridge between the Stellar blockchain and the frontend**. I
 | `StellarModule` | Shared global Stellar RPC client + utilities |
 
 > Role/permission matrix (buyer, supplier, logistics, arbiter, admin — endpoint by endpoint): [docs/rbac.md](./docs/rbac.md)
+>
+> Machine-to-machine authentication via API keys (create, rotate, revoke, scopes, security best practices): [docs/api-keys.md](./docs/api-keys.md)
+>
+> GraphQL API (endpoint, authentication, all queries/subscriptions, depth/complexity limits, DataLoader batching, GraphQL vs REST guidance): [docs/graphql.md](./docs/graphql.md)
 
 ---
 
@@ -89,6 +93,12 @@ All endpoints are prefixed with `/api/v1` (URI versioning; see [API Versioning](
 |--------|------|-------------|
 | `GET` | `/auth/nonce?address=G...` | Get challenge nonce for a Stellar address |
 | `POST` | `/auth/login` | Submit signed nonce, receive JWT |
+| `GET` | `/auth/api-keys` | List your API keys (JWT) |
+| `POST` | `/auth/api-keys` | Create an API key — plaintext shown once (JWT) |
+| `POST` | `/auth/api-keys/:id/rotate` | Rotate a key with optional grace period (JWT) |
+| `DELETE` | `/auth/api-keys/:id` | Revoke an API key (JWT) |
+
+> 🔑 **API Keys**: For machine-to-machine auth (CI pipelines, backend services) see [docs/api-keys.md](./docs/api-keys.md) — covers the `X-Api-Key` header, scopes, key rotation, and security best practices.
 
 ### Shipments
 | Method | Path | Auth | Description |
@@ -128,6 +138,19 @@ All endpoints are prefixed with `/api/v1` (URI versioning; see [API Versioning](
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | — | Database + service health check |
+
+### GraphQL
+
+> 📊 **GraphQL API**: A GraphQL layer runs at `/graphql` (no `/api/v1` prefix) alongside these REST routes. See [docs/graphql.md](./docs/graphql.md) for the endpoint URL, JWT auth setup, all available queries and subscriptions, query depth/complexity limits, and a GraphQL vs REST guide.
+
+| Operation | Type | Description |
+|-----------|------|-------------|
+| `shipment(id)` | Query | Single shipment with milestones and recent events |
+| `shipments(status, page, limit)` | Query | Paginated list of shipments visible to the caller |
+| `milestones(shipmentId)` | Query | All milestones for a shipment (DataLoader-batched) |
+| `milestone(id)` | Query | Single milestone with proof submission history |
+| `shipmentUpdated(id)` | Subscription | Live push when a shipment changes |
+| `milestoneUpdated(shipmentId)` | Subscription | Live push when a milestone on a shipment changes |
 
 ---
 

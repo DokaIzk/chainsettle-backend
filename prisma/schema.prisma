@@ -391,10 +391,11 @@ model Notification {
   title      String
   message    String
   data       Json?            // extra context (shipmentId, amount, etc.)
-  read       Boolean          @default(false)
-  emailSent  Boolean          @default(false)
+  read         Boolean          @default(false)
+  emailSent    Boolean          @default(false)
   deliverAfter DateTime?
-  createdAt  DateTime         @default(now())
+  snoozedUntil DateTime?        // set by the user; excluded from list while snoozedUntil > now()
+  createdAt    DateTime         @default(now())
 
   // Relations
   user User @relation(fields: [userId], references: [id])
