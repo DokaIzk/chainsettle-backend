@@ -130,9 +130,49 @@ model User {
   shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
+  announcementDismissals AnnouncementDismissal[]
 
   @@index([kycExpiresAt])
   @@map("users")
+}
+
+enum AnnouncementSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+/// Admin-managed platform banner (#426). Shown while startsAt <= now < endsAt
+/// to users whose role is in audienceRoles (empty = everyone).
+model Announcement {
+  id            String               @id @default(uuid())
+  title         String
+  body          String
+  severity      AnnouncementSeverity @default(INFO)
+  startsAt      DateTime
+  endsAt        DateTime?
+  audienceRoles UserRole[]           @default([])
+  createdById   String?
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  dismissals AnnouncementDismissal[]
+
+  @@index([startsAt, endsAt])
+  @@map("announcements")
+}
+
+model AnnouncementDismissal {
+  announcementId String
+  userId         String
+  dismissedAt    DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([announcementId, userId])
+  @@index([userId])
+  @@map("announcement_dismissals")
 }
 
 model Shipment {

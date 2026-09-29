@@ -14,6 +14,7 @@ import {
   OPEN_DISPUTES_GAUGE,
   DISPUTE_RESOLUTION_TIME_HISTOGRAM,
 } from './metrics.service';
+import { resolveBuildInfo } from '../build-info';
 
 const logger = new Logger('MetricsModule');
 
@@ -82,6 +83,12 @@ export async function collectOpenDisputes(this: Gauge<string>, prisma: PrismaSer
       labelNames: ['status'],
       inject: [PrismaService],
       collect: collectShipmentsByStatus,
+    }),
+    makeGaugeProvider({
+      name: BUILD_INFO_GAUGE,
+      help: 'Build information for the running instance; value is always 1',
+      labelNames: ['version', 'gitSha', 'buildTime', 'nodeVersion'],
+      collect: collectBuildInfo,
     }),
     MetricsService,
   ],

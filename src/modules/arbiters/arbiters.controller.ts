@@ -13,7 +13,29 @@ import { CurrentUser } from '../../common/decorators/current-user.decorator';
 @UseGuards(JwtAuthGuard)
 @Controller('arbiters')
 export class ArbitersController {
-  constructor(private readonly arbitersService: ArbitersService) {}
+  constructor(
+    private readonly arbitersService: ArbitersService,
+    private readonly directory: ArbiterDirectoryService,
+  ) {}
+
+  /**
+   * GET /arbiters — public directory of opted-in arbiters (#398).
+   * Declared before the :address routes so the literal path is never captured as a param.
+   */
+  @Get()
+  @ApiOperation({ summary: 'Browse arbiters: filter by minScore, availability and name/organization' })
+  @ApiResponse({ status: 200, description: 'Paginated arbiter directory (public profile fields only)' })
+  listDirectory(@Query() query: ArbiterDirectoryQueryDto) {
+    return this.directory.list(query);
+  }
+
+  @Patch('me/directory')
+  @ApiOperation({ summary: "Update the authenticated arbiter's directory listing, availability and organization" })
+  @ApiResponse({ status: 200, description: 'Updated directory settings' })
+  @ApiResponse({ status: 403, description: 'Caller is not an arbiter' })
+  updateDirectoryProfile(@CurrentUser('id') userId: string, @Body() dto: UpdateDirectoryProfileDto) {
+    return this.directory.updateOwnProfile(userId, dto);
+  }
 
   /**
    * PATCH /api/v1/arbiters/me/availability
