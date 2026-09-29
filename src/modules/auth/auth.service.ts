@@ -129,6 +129,7 @@ export class AuthService {
         name: true,
         email: true,
         role: true,
+        displayCurrency: true,
         deactivatedAt: true,
         createdAt: true,
       },
@@ -532,6 +533,22 @@ export class AuthService {
     };
   }
 
+  /**
+   * Returns the stored displayCurrency preference for a user.
+   * Falls back to 'USD' for unknown users or DB errors — never throws.
+   */
+  async getUserDisplayCurrency(userId: string): Promise<string> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { displayCurrency: true },
+      });
+      return user?.displayCurrency ?? 'USD';
+    } catch {
+      return 'USD';
+    }
+  }
+
   async updateProfile(userId: string, dto: UpdateProfileDto) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
 
@@ -543,6 +560,10 @@ export class AuthService {
 
     if (dto.name !== undefined) {
       updateData.name = dto.name;
+    }
+
+    if (dto.displayCurrency !== undefined) {
+      updateData.displayCurrency = dto.displayCurrency.toUpperCase();
     }
 
     if (dto.email !== undefined && dto.email !== user.email) {

@@ -108,4 +108,8 @@ export const envValidationSchema = Joi.object({
   // FX rate service (#231)
   FX_RATE_API_URL: Joi.string().uri().allow('').optional(),
   FX_RATE_CACHE_TTL_SECONDS: Joi.number().integer().min(1).default(300),
+  // How many minutes after the last successful fetch a rate is considered stale.
+  // Defaults to the cache TTL window (5 minutes). Stale rates are still served
+  // but the response includes `stale: true` so clients can warn users.
+  FX_STALE_AFTER_MINUTES: Joi.number().integer().min(1).default(10),
 }).options({ allowUnknown: true });
