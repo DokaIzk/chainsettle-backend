@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Delete,
@@ -44,13 +45,22 @@ export class CommentsController {
   })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'milestoneIndex', required: false, type: Number, description: 'Only comments scoped to this milestone' })
   findAll(
     @Param('id') shipmentId: string,
     @Query('page') page?: number,
     @Query('limit') limit?: number,
     @CurrentUser() user: any = {},
+    @Query('milestoneIndex') milestoneIndex?: string,
   ) {
-    return this.commentsService.findAll(shipmentId, user.stellarAddress, page, limit);
+    let milestoneFilter: number | undefined;
+    if (milestoneIndex !== undefined && milestoneIndex !== '') {
+      milestoneFilter = Number(milestoneIndex);
+      if (!Number.isInteger(milestoneFilter) || milestoneFilter < 0) {
+        throw new BadRequestException('milestoneIndex must be a non-negative integer');
+      }
+    }
+    return this.commentsService.findAll(shipmentId, user.stellarAddress, page, limit, milestoneFilter);
   }
 
   /**

@@ -1880,7 +1880,11 @@ export class ShipmentsService {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        milestones: {
+          where: { deletedAt: null },
+          orderBy: { milestoneIndex: 'asc' },
+          include: { proofSubmissions: { orderBy: { createdAt: 'desc' }, take: 1 } },
+        },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
       },
@@ -1928,7 +1932,8 @@ export class ShipmentsService {
           doc.text(
             `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
             (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : '') +
-            (m.proofHash ? ` — Proof: ${m.proofHash}` : ''),
+            (m.proofHash ? ` — Proof: ${m.proofHash}` : '') +
+            (m.proofSubmissions?.[0]?.sha256 ? ` — SHA-256: ${m.proofSubmissions[0].sha256}` : ''),
           );
         }
       }
