@@ -31,7 +31,9 @@ export class AuthService {
   private readonly NONCE_PREFIX = 'chainsettle:nonce:';
   private readonly NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
   private readonly EMAIL_VERIFICATION_TOKEN_PREFIX = 'chainsettle:email-verification-token:';
-
+  private readonly PHONE_OTP_PREFIX = 'chainsettle:phone-otp:';
+  private readonly PHONE_OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes for OTP
+  private readonly PHONE_OTP_LENGTH = 6;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -722,5 +724,91 @@ export class AuthService {
     );
 
     return { message: 'Verification email sent' };
+  }
+
+  // ----------------------------------------------------------
+  // Phone verification
+  // ----------------------------------------------------------
+
+  /**
+   * Initiate phone number verification by sending an OTP.
+   * Stores the pending phone and OTP in Redis.
+   */
+  async sendPhoneVerificationOtp(userId: string, phoneNumber: string): Promise<{ message: string }> {
+    // Check if phone is already verified
+    const existingUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { phoneNumber: true, phoneVerified: true },
+    });
+
+    if (existingUser?.phoneVerified && existingUser?.phoneNumber === phoneNumber) {
+      throw new BadRequestException('Phone number is already verified');
+    }
+
+    // Generate OTP
+    const otp = this.generateOtp();
+    const key = `${this.PHONE_OTP_PREFIX}${userId}`;
+
+    // Store OTP in Redis with 5-minute TTL
+    await this.redis.setPx(key, otp, this.PHONE_OTP_TTL_MS);
+
+    // Store pending phone number (overwrites any previous pending)
+    const pendingKey = `${this.PHONE_OTP_PREFIX}${userId}:pending`;
+    await this.redis.setPx(pendingKey, phoneNumber, this.PHONE_OTP_TTL_MS);
+
+    // TODO: Actually send SMS via SMS provider when implemented
+    // For now, log the OTP for development
+    this.logger.log(`Phone verification OTP for ${userId}: ${otp}`);
+
+    return { message: 'Verification code sent to your phone' };
+  }
+
+  /**
+   * Verify phone number with OTP.
+   * If OTP is valid, updates user's phoneNumber and sets phoneVerified to true.
+   */
+  async verifyPhone(userId: string, otp: string): Promise<{ message: string; phoneNumber: string }> {
+    const key = `${this.PHONE_OTP_PREFIX}${userId}`;
+    const pendingKey = `${this.PHONE_OTP_PREFIX}${userId}:pending`;
+
+    const storedOtp = await this.redis.get(key);
+    const pendingPhone = await this.redis.get(pendingKey);
+
+    if (!storedOtp || storedOtp !== otp) {
+      throw new UnauthorizedException('Invalid or expired verification code');
+    }
+
+    if (!pendingPhone) {
+      throw new BadRequestException('No pending phone verification. Request a new code.');
+    }
+
+    // Clear the OTP and pending phone
+    await this.redis.del(key);
+    await this.redis.del(pendingKey);
+
+    // Update user's phone
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        phoneNumber: pendingPhone,
+        phoneVerified: true,
+        pendingPhone: null,
+      },
+    });
+
+    this.logger.log(`Phone verified for user ${userId}: ${pendingPhone}`);
+
+    return { message: 'Phone number verified successfully', phoneNumber: pendingPhone };
+  }
+
+  /**
+   * Generate a numeric OTP of configured length.
+   */
+  private generateOtp(): string {
+    let otp = '';
+    for (let i = 0; i < this.PHONE_OTP_LENGTH; i++) {
+      otp += Math.floor(Math.random() * 10).toString();
+    }
+    return otp;
   }
 }
