@@ -47,6 +47,15 @@ export class FindAllShipmentsDto {
   @IsString()
   cursor?: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Comma-separated sparse fieldset, e.g. id,status,totalAmount. id is always included; unknown fields return 400.',
+    example: 'id,status,totalAmount',
+  })
+  @IsOptional()
+  @IsString()
+  fields?: string;
+
   @ApiPropertyOptional({ description: 'Search in description (full-text search)' })
   @IsOptional()
   @IsString()

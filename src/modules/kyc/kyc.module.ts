@@ -3,14 +3,13 @@ import { KycController } from './kyc.controller';
 import { KycService } from './kyc.service';
 import { AuditLogsModule } from '../audit-logs/audit-logs.module';
 import { NotificationsModule } from '../notifications/notifications.module';
-import { AdminKycController } from './admin-kyc.controller';
-import { KycReviewService } from './kyc-review.service';
+import { KycExpiryJob } from './kyc-expiry.job';
 
 @Global()
 @Module({
   imports: [AuditLogsModule, NotificationsModule],
-  controllers: [KycController, AdminKycController],
-  providers: [KycService, KycReviewService],
+  controllers: [KycController],
+  providers: [KycService, KycExpiryJob],
   exports: [KycService],
 })
 export class KycModule {}

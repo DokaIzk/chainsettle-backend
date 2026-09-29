@@ -1,11 +1,11 @@
 import { Body, Controller, Get, Param, Patch, Query, UseGuards } from '@nestjs/common';
+import { UserRole } from '@prisma/client';
 import { ApiBearerAuth, ApiOperation, ApiParam, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { ArbitersService } from './arbiters.service';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AddressParamDto } from './dto/address-param.dto';
-import { ArbiterDirectoryService } from './arbiter-directory.service';
-import { ArbiterDirectoryQueryDto } from './dto/arbiter-directory-query.dto';
-import { UpdateDirectoryProfileDto } from './dto/update-directory-profile.dto';
+import { UpdateAvailabilityDto } from './dto/update-availability.dto';
+import { Roles } from '../../common/decorators/roles.decorator';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 
 @ApiTags('arbiters')
@@ -35,6 +35,20 @@ export class ArbitersController {
   @ApiResponse({ status: 403, description: 'Caller is not an arbiter' })
   updateDirectoryProfile(@CurrentUser('id') userId: string, @Body() dto: UpdateDirectoryProfileDto) {
     return this.directory.updateOwnProfile(userId, dto);
+  }
+
+  /**
+   * PATCH /api/v1/arbiters/me/availability
+   * Set or clear the caller's away period (#397). Arbiter role only.
+   */
+  @Patch('me/availability')
+  @Roles(UserRole.ARBITER)
+  @ApiOperation({ summary: 'Set or clear your arbiter away period' })
+  @ApiResponse({ status: 200, description: 'Updated availability' })
+  @ApiResponse({ status: 400, description: 'awayUntil is not in the future' })
+  @ApiResponse({ status: 403, description: 'Arbiter role required' })
+  setAvailability(@CurrentUser() user: any, @Body() dto: UpdateAvailabilityDto) {
+    return this.arbitersService.setAvailability(user.id, dto.awayUntil, dto.awayMessage);
   }
 
   @Get(':address/reputation')
