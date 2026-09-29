@@ -278,10 +278,17 @@ export class ShipmentTemplatesService {
 
     // Soft-delete (#306): the row is kept so audit log entries referencing it
     // still resolve; findOne/findAll/findMine exclude it from then on.
-    await this.prisma.shipmentTemplate.update({
-      where: { id },
-      data: { deletedAt: new Date() },
-    });
+    await this.prisma.$transaction([
+      this.prisma.shipmentTemplate.update({
+        where: { id },
+        data: { deletedAt: new Date() },
+      }),
+      // Recurring schedules built on this template stop generating drafts (#389).
+      this.prisma.recurringSchedule.updateMany({
+        where: { templateId: id, active: true },
+        data: { active: false },
+      }),
+    ]);
 
     return { success: true };
   }

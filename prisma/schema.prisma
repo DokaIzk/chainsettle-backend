@@ -220,6 +220,7 @@ model Shipment {
   watchers  ShipmentWatcher[]
   favorites ShipmentFavorite[]
   approvals ShipmentApproval[]
+  reminders ShipmentReminder[]
 
   isDraft          Boolean         @default(false) // true when created via CSV bulk import; no on-chain backing yet
 
@@ -586,6 +587,7 @@ model ShipmentTemplate {
 
   // Relations
   owner User @relation("ShipmentTemplates", fields: [ownerId], references: [id], onDelete: Cascade)
+  recurringSchedules RecurringSchedule[]
 
   @@index([ownerId])
   @@index([isPublic])
@@ -737,4 +739,49 @@ model ArchivedShipment {
   @@index([archivedAt])
   @@index([terminalAt])
   @@map("archived_shipments")
+}
+/// A personal follow-up a user sets on a shipment (#386). Private to its
+/// creator; delivered once by ShipmentReminderJob when `remindAt` passes.
+model ShipmentReminder {
+  id         String    @id @default(uuid())
+  shipmentId String
+  userId     String
+  remindAt   DateTime
+  message    String
+  sentAt     DateTime?
+  createdAt  DateTime  @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  user     User     @relation("ShipmentReminders", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([shipmentId, userId])
+  @@index([sentAt, remindAt])
+  @@map("shipment_reminders")
+}
+
+enum RecurringInterval {
+  WEEKLY
+  MONTHLY
+}
+
+/// Creates a draft shipment from a template on a fixed cadence (#389).
+model RecurringSchedule {
+  id          String            @id @default(uuid())
+  ownerId     String
+  templateId  String
+  interval    RecurringInterval
+  totalAmount BigInt            // stroops; templates carry no amount
+  nextRunAt   DateTime
+  lastRunAt   DateTime?
+  active      Boolean           @default(true)
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  owner    User             @relation("RecurringSchedules", fields: [ownerId], references: [id], onDelete: Cascade)
+  template ShipmentTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId])
+  @@index([templateId])
+  @@index([active, nextRunAt])
+  @@map("recurring_schedules")
 }

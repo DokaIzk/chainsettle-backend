@@ -6,6 +6,7 @@ import {
   ForbiddenException,
   BadRequestException,
   InternalServerErrorException,
+  PreconditionFailedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash } from 'crypto';
@@ -28,6 +29,27 @@ import { parse } from 'csv-parse/sync';
 import Ajv from 'ajv';
 import { metadataSchemas } from './schemas/metadata.schemas';
 import { pickFields } from './shipment-fields';
+
+const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Strong ETag for a shipment's mutable state (#387). Derived from id and
+ * updatedAt so every successful write produces a new value.
+ */
+export function shipmentEtag(shipment: { id: string; updatedAt: Date }): string {
+  const hash = createHash('sha1')
+    .update(`${shipment.id}:${new Date(shipment.updatedAt).toISOString()}`)
+    .digest('hex');
+  return `"${hash}"`;
+}
+
+/** True when an If-Match header value matches the current ETag (or is `*`). */
+export function ifMatchSatisfied(ifMatch: string, currentEtag: string): boolean {
+  return ifMatch
+    .split(',')
+    .map((v) => v.trim().replace(/^W\//, ''))
+    .some((v) => v === '*' || v === currentEtag);
+}
 
 @Injectable()
 export class ShipmentsService {
@@ -697,7 +719,7 @@ export class ShipmentsService {
    * Only the buyer can update a shipment.
    * Financial fields and addresses are immutable and ignored if provided.
    */
-  async update(id: string, buyerAddress: string, dto: any) {
+  async update(id: string, buyerAddress: string, dto: any, ifMatch?: string) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
     });
@@ -705,6 +727,7 @@ export class ShipmentsService {
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     // Verify buyer is the one making the update
     if (shipment.buyerAddress !== buyerAddress) {
@@ -728,8 +751,7 @@ export class ShipmentsService {
     if (dto.metadata !== undefined) updateData.metadata = dto.metadata;
     if (dto.tags !== undefined) updateData.tags = dto.tags;
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: updateData,
       include: {
         milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
@@ -747,15 +769,17 @@ export class ShipmentsService {
     tags: string[] | undefined,
     callerAddress?: string,
     callerId?: string,
+    ifMatch?: string,
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
-      select: { id: true, tags: true },
+      select: { id: true, tags: true, updatedAt: true },
     });
 
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     if (!Array.isArray(tags)) {
       throw new BadRequestException('tags must be an array');
@@ -784,8 +808,7 @@ export class ShipmentsService {
 
     const nextTags = Array.from(normalizedTags.values());
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: { tags: nextTags },
       include: {
         milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
@@ -807,6 +830,122 @@ export class ShipmentsService {
 
     this.logger.log(`Shipment tags replaced: ${id}`);
     return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // OPTIMISTIC CONCURRENCY (#387)
+  // ----------------------------------------------------------
+
+  /** Returns the current ETag for a shipment. */
+  async getEtag(id: string): Promise<string> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { id: true, updatedAt: true },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    return shipmentEtag(shipment);
+  }
+
+  private assertIfMatch(shipment: { id: string; updatedAt: Date }, ifMatch?: string) {
+    if (ifMatch === undefined || ifMatch === null || ifMatch === '') {
+      if (this.config.get<string>('SHIPMENT_REQUIRE_IF_MATCH') === 'true') {
+        throw new PreconditionFailedException('If-Match header is required');
+      }
+      return;
+    }
+    if (!ifMatchSatisfied(ifMatch, shipmentEtag(shipment))) {
+      throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+    }
+  }
+
+  /**
+   * Updates a shipment, and when an If-Match was supplied also pins the write
+   * to the updatedAt that was checked so a concurrent writer that slipped in
+   * between the read and the write causes a 412 instead of a lost update.
+   */
+  private async conditionalUpdate(
+    shipment: { id: string; updatedAt: Date },
+    ifMatch: string | undefined,
+    args: { data: any; include?: any },
+  ) {
+    const where: any = ifMatch
+      ? { id: shipment.id, updatedAt: shipment.updatedAt }
+      : { id: shipment.id };
+    try {
+      return await this.prisma.shipment.update({ where, ...args });
+    } catch (err: any) {
+      if (ifMatch && err?.code === 'P2025') {
+        throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+      }
+      throw err;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // DUPLICATE CHECK (#388)
+  // ----------------------------------------------------------
+
+  /**
+   * Finds the caller's ACTIVE shipments that look like duplicates of a
+   * shipment about to be created. Read-only.
+   */
+  async findPossibleDuplicates(
+    buyerAddress: string,
+    dto: { supplierAddress?: string; tokenAddress?: string; totalAmount?: string; referenceNumber?: string },
+  ) {
+    const since = new Date(Date.now() - DUPLICATE_WINDOW_MS);
+    let amount: bigint | undefined;
+    try {
+      amount = dto.totalAmount !== undefined ? BigInt(dto.totalAmount) : undefined;
+    } catch {
+      throw new BadRequestException('totalAmount must be an integer string');
+    }
+
+    const or: any[] = [];
+    if (dto.supplierAddress && dto.tokenAddress && amount !== undefined) {
+      or.push({
+        supplierAddress: dto.supplierAddress,
+        tokenAddress: dto.tokenAddress,
+        totalAmount: amount,
+        createdAt: { gte: since },
+      });
+    }
+    if (dto.referenceNumber) {
+      or.push({ referenceNumber: dto.referenceNumber });
+    }
+    if (or.length === 0) return { possibleDuplicates: [] };
+
+    const matches = await this.prisma.shipment.findMany({
+      where: { buyerAddress, status: ShipmentStatus.ACTIVE, OR: or },
+      select: {
+        id: true,
+        createdAt: true,
+        referenceNumber: true,
+        supplierAddress: true,
+        tokenAddress: true,
+        totalAmount: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return {
+      possibleDuplicates: matches.map((m) => {
+        const matchReasons: string[] = [];
+        if (
+          amount !== undefined &&
+          m.supplierAddress === dto.supplierAddress &&
+          m.tokenAddress === dto.tokenAddress &&
+          BigInt(m.totalAmount) === amount &&
+          m.createdAt >= since
+        ) {
+          matchReasons.push('SAME_SUPPLIER_TOKEN_AMOUNT_WITHIN_7_DAYS');
+        }
+        if (dto.referenceNumber && m.referenceNumber === dto.referenceNumber) {
+          matchReasons.push('SAME_REFERENCE_NUMBER');
+        }
+        return { id: m.id, createdAt: m.createdAt, referenceNumber: m.referenceNumber, matchReasons };
+      }),
+    };
   }
 
   // ----------------------------------------------------------

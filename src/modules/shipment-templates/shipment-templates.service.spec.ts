@@ -14,6 +14,10 @@ describe('ShipmentTemplatesService — soft delete (#306)', () => {
         update: jest.fn().mockResolvedValue({}),
         delete: jest.fn(),
       },
+      recurringSchedule: {
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      },
+      $transaction: jest.fn((ops: any[]) => Promise.all(ops)),
     };
     service = new ShipmentTemplatesService(prisma, { record: jest.fn() } as any);
   });
@@ -27,6 +31,17 @@ describe('ShipmentTemplatesService — soft delete (#306)', () => {
     expect(prisma.shipmentTemplate.update).toHaveBeenCalledWith({
       where: { id: 't1' },
       data: { deletedAt: expect.any(Date) },
+    });
+  });
+
+  it('deactivates recurring schedules that depend on the deleted template (#389)', async () => {
+    prisma.shipmentTemplate.findFirst.mockResolvedValue({ id: 't1', ownerId: 'owner-1' });
+
+    await service.delete('t1', 'owner-1');
+
+    expect(prisma.recurringSchedule.updateMany).toHaveBeenCalledWith({
+      where: { templateId: 't1', active: true },
+      data: { active: false },
     });
   });
 

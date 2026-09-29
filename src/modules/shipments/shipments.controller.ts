@@ -50,6 +50,8 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole } from '@prisma/client';
 import { parseFields, SHIPMENT_LIST_FIELDS, SHIPMENT_DETAIL_FIELDS } from './shipment-fields';
 import { RedisService } from '../../common/redis/redis.service';
+import { ShipmentRemindersService } from './shipment-reminders.service';
+import { CreateShipmentReminderDto } from './dto/shipment-reminder.dto';
 
 @ApiTags('shipments')
 @ApiBearerAuth()
@@ -61,6 +63,7 @@ export class ShipmentsController {
     private readonly shipmentApprovals: ShipmentApprovalsService,
     private readonly savedFilters: SavedFiltersService,
     private readonly redis: RedisService,
+    private readonly reminders: ShipmentRemindersService,
   ) { }
 
   /**
@@ -112,6 +115,19 @@ export class ShipmentsController {
     }
 
     return this.shipmentsService.create(dto);
+  }
+
+  /**
+   * POST /api/v1/shipments/duplicate-check
+   * Warns about likely duplicates before the buyer signs the on-chain tx (#388).
+   * Takes the same body as create; has no side effects.
+   */
+  @Post('duplicate-check')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Find the caller's ACTIVE shipments that look like duplicates" })
+  @ApiResponse({ status: 200, description: '{ possibleDuplicates: [{ id, createdAt, referenceNumber, matchReasons }] }' })
+  duplicateCheck(@Body() dto: CreateShipmentDto, @CurrentUser() user: any) {
+    return this.shipmentsService.findPossibleDuplicates(user.stellarAddress, dto);
   }
 
   /**
@@ -322,8 +338,18 @@ export class ShipmentsController {
   @ApiResponse({ status: 200, description: 'Shipment tags replaced successfully' })
   @ApiResponse({ status: 400, description: 'Invalid tag list' })
   @ApiResponse({ status: 403, description: 'Not a shipment participant' })
-  replaceTags(@Param('id') id: string, @Body() body: { tags: string[] }, @CurrentUser() user: any) {
-    return this.shipmentsService.replaceTags(id, body?.tags, user?.stellarAddress, user?.id);
+  @ApiResponse({ status: 412, description: 'If-Match does not match the current ETag' })
+  @ApiHeader({ name: 'If-Match', required: false, description: 'ETag from GET /shipments/:id' })
+  async replaceTags(
+    @Param('id') id: string,
+    @Body() body: { tags: string[] },
+    @CurrentUser() user: any,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('if-match') ifMatch?: string,
+  ) {
+    const result = await this.shipmentsService.replaceTags(id, body?.tags, user?.stellarAddress, user?.id, ifMatch);
+    res.setHeader('ETag', await this.shipmentsService.getEtag(id));
+    return result;
   }
 
   /**
@@ -615,8 +641,57 @@ export class ShipmentsController {
   @ApiResponse({ status: 200, description: 'Shipment updated successfully' })
   @ApiResponse({ status: 403, description: 'Only buyer can update' })
   @ApiResponse({ status: 409, description: 'Reference number already in use' })
-  update(@Param('id') id: string, @Body() dto: UpdateShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.update(id, user.stellarAddress, dto);
+  @ApiResponse({ status: 412, description: 'If-Match does not match the current ETag' })
+  @ApiHeader({ name: 'If-Match', required: false, description: 'ETag from GET /shipments/:id (required when SHIPMENT_REQUIRE_IF_MATCH=true)' })
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateShipmentDto,
+    @CurrentUser() user: any,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('if-match') ifMatch?: string,
+  ) {
+    const result = await this.shipmentsService.update(id, user.stellarAddress, dto, ifMatch);
+    res.setHeader('ETag', await this.shipmentsService.getEtag(id));
+    return result;
+  }
+
+  /**
+   * POST /api/v1/shipments/:id/reminders
+   * Create a personal reminder on a shipment (#386). Private to the caller.
+   */
+  @Post(':id/reminders')
+  @UseGuards(ShipmentParticipantGuard)
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Create a personal reminder on a shipment' })
+  @ApiResponse({ status: 400, description: 'remindAt in the past or reminder limit reached' })
+  createReminder(@Param('id') id: string, @Body() dto: CreateShipmentReminderDto, @CurrentUser() user: any) {
+    return this.reminders.create(id, user.id, dto);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/reminders
+   * List the caller's own reminders on a shipment.
+   */
+  @Get(':id/reminders')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: "List the caller's reminders on a shipment" })
+  listReminders(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.reminders.list(id, user.id);
+  }
+
+  /**
+   * DELETE /api/v1/shipments/:id/reminders/:reminderId
+   */
+  @Delete(':id/reminders/:reminderId')
+  @UseGuards(ShipmentParticipantGuard)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Delete one of the caller\'s reminders' })
+  async deleteReminder(
+    @Param('id') id: string,
+    @Param('reminderId') reminderId: string,
+    @CurrentUser() user: any,
+  ) {
+    await this.reminders.remove(id, reminderId, user.id);
   }
 
   /**
