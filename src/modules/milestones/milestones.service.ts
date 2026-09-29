@@ -220,10 +220,28 @@ export class MilestonesService {
       { shipmentId, milestoneIndex, proofHash: cid },
     );
 
+    // Checklist (#392): warn, don't block, when required items are incomplete.
+    const incompleteChecklist = await this.prisma.milestoneChecklistItem.findMany({
+      where: { milestoneId: milestone.id, required: true, completedAt: null },
+      orderBy: { createdAt: 'asc' },
+      select: { label: true },
+    });
+
     return {
       milestone: updated,
       cid,
       gatewayUrl: this.ipfs.getGatewayUrl(cid),
+      ...(incompleteChecklist.length > 0
+        ? {
+            warnings: [
+              {
+                code: 'CHECKLIST_INCOMPLETE',
+                message: `${incompleteChecklist.length} required checklist item(s) are not complete`,
+                items: incompleteChecklist.map((i) => i.label),
+              },
+            ],
+          }
+        : {}),
     };
   }
 

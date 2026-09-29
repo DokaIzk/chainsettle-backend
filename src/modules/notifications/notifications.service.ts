@@ -173,6 +173,9 @@ export class NotificationsService {
       this.logger.error(`Failed to notify ${stellarAddress}`, error.message);
     }
   }
+
+  /**
+   * Like notifyUser() but always sends an email regardless of the user's digest
    * preference. Used for high-signal events such as direct @mentions (#190).
    */
   async notifyUserWithForcedEmail(

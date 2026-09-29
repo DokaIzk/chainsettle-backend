@@ -27,6 +27,7 @@ import { randomUUID } from 'crypto';
 import { parse } from 'csv-parse/sync';
 import Ajv from 'ajv';
 import { metadataSchemas } from './schemas/metadata.schemas';
+import { pickFields } from './shipment-fields';
 
 @Injectable()
 export class ShipmentsService {
@@ -184,6 +185,17 @@ export class ShipmentsService {
             paymentPercent: m.paymentPercent,
             ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
             ...(m.dueDays ? { dueAt: new Date(Date.now() + m.dueDays * 24 * 60 * 60 * 1000) } : {}),
+            // Template checklists (#392) become real checklist items.
+            ...(Array.isArray(m.checklist) && m.checklist.length > 0
+              ? {
+                  checklistItems: {
+                    create: m.checklist.map((c: any) => ({
+                      label: String(c.label),
+                      required: c.required ?? true,
+                    })),
+                  },
+                }
+              : {}),
           })),
         },
       },
@@ -230,6 +242,8 @@ export class ShipmentsService {
     isDraft?: boolean;
     favorite?: boolean;
     callerUserId?: string;
+    /** Sparse fieldset (#390), already validated by parseFields(). */
+    fields?: string[];
   }) {
     const {
       buyerAddress,
@@ -251,6 +265,7 @@ export class ShipmentsService {
       isDraft,
       favorite,
       callerUserId,
+      fields,
     } = filters;
 
     if (cursor && page && page !== 1) {
@@ -314,6 +329,13 @@ export class ShipmentsService {
       ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
       : {};
 
+    // Sparse fieldsets (#390): push the selection into Prisma rather than
+    // trimming afterwards. When no fields are requested, keep the full include.
+    const milestonesQuery = { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } };
+    const projection: any = fields
+      ? { select: this.buildSelect(fields, { milestones: milestonesQuery, ...favoriteInclude }) }
+      : { include: { milestones: milestonesQuery, ...favoriteInclude } };
+
     let shipments: any[];
     let total: number | null = null;
     let nextCursor: string | null = null;
@@ -359,10 +381,12 @@ export class ShipmentsService {
       total = Number((countResult as any[])[0].count);
 
       for (const s of shipments) {
-        s.milestones = await db.milestone.findMany({
-          where: { shipmentId: s.id, deletedAt: null },
-          orderBy: { milestoneIndex: 'asc' },
-        });
+        if (!fields || fields.includes('milestones')) {
+          s.milestones = await db.milestone.findMany({
+            where: { shipmentId: s.id, deletedAt: null },
+            orderBy: { milestoneIndex: 'asc' },
+          });
+        }
         if (callerUserId) {
           s.favorites = await this.prisma.shipmentFavorite.findMany({
             where: { shipmentId: s.id, userId: callerUserId },
@@ -381,10 +405,7 @@ export class ShipmentsService {
       const db = this.prisma.read;
       shipments = await db.shipment.findMany({
         where: { ...where, createdAt: { lte: new Date(decoded.createdAt) } },
-        include: {
-          milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-          ...favoriteInclude,
-        },
+        ...projection,
         orderBy: { createdAt: 'desc' },
         cursor: { id: decoded.id },
         skip: 1,
@@ -405,10 +426,7 @@ export class ShipmentsService {
       [shipments, total] = await db.$transaction([
         db.shipment.findMany({
           where,
-          include: {
-            milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-            ...favoriteInclude,
-          },
+          ...projection,
           orderBy: { createdAt: 'desc' },
           skip: (page - 1) * limit,
           take: limit,
@@ -419,7 +437,10 @@ export class ShipmentsService {
 
     return {
       data: await Promise.all(
-        shipments.map((s) => this.serialize(s, callerUserId)),
+        shipments.map(async (s) => {
+          const serialized = await this.serialize(s, callerUserId);
+          return fields ? pickFields(serialized, fields) : serialized;
+        }),
       ),
       meta: cursor
         ? { nextCursor, limit }
@@ -433,22 +454,50 @@ export class ShipmentsService {
     };
   }
 
-  async findOne(id: string, callerUserId?: string, precisionOverride?: number) {
+  async findOne(id: string, callerUserId?: string, precisionOverride?: number, fields?: string[]) {
     const db = this.prisma.read;
-    const shipment = await db.shipment.findUnique({
+    const relations = {
+      milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } },
+      events: { orderBy: { ledger: 'desc' as const }, take: 20 },
+      trackingUpdates: { orderBy: { createdAt: 'asc' as const } },
+      approvals: { orderBy: { createdAt: 'asc' as const } },
+      ...(callerUserId
+        ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
+        : {}),
+    };
+    const shipment: any = await db.shipment.findUnique({
       where: { id },
-      include: {
-        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-        events: { orderBy: { ledger: 'desc' }, take: 20 },
-        trackingUpdates: { orderBy: { createdAt: 'asc' } },
-        approvals: { orderBy: { createdAt: 'asc' } },
-        ...(callerUserId
-          ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
-          : {}),
-      },
-    });
+      ...(fields ? { select: this.buildSelect(fields, relations) } : { include: relations }),
+    } as any);
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
-    return this.serialize(shipment, callerUserId, precisionOverride);
+    const serialized = await this.serialize(shipment, callerUserId, precisionOverride);
+    return fields ? pickFields(serialized, fields) : serialized;
+  }
+
+  /**
+   * findAll with a short-lived per-caller Redis cache. The key hashes every
+   * filter — including the sparse fieldset — so different field selections
+   * never share an entry (#390).
+   */
+  async findAllCached(filters: Parameters<ShipmentsService['findAll']>[0]) {
+    const caller = filters.callerStellarAddress;
+    if (!caller || filters.search) return this.findAll(filters);
+
+    const key = this.buildCacheKey(caller, filters);
+    try {
+      const cached = await this.redis.getJson<Awaited<ReturnType<ShipmentsService['findAll']>>>(key);
+      if (cached) return cached;
+    } catch (err) {
+      this.logger.warn(`Shipment list cache read failed: ${(err as Error).message}`);
+    }
+
+    const result = await this.findAll(filters);
+    try {
+      await this.redis.setJson(key, result, this.cacheTtl);
+    } catch (err) {
+      this.logger.warn(`Shipment list cache write failed: ${(err as Error).message}`);
+    }
+    return result;
   }
 
   /**
@@ -2126,6 +2175,25 @@ export class ShipmentsService {
   // ----------------------------------------------------------
   // INTERNAL HELPERS
   // ----------------------------------------------------------
+
+  /**
+   * Prisma `select` for a sparse fieldset. Always includes the columns the
+   * serializer needs (id, createdAt for cursors, token decimals/symbol for
+   * amount formatting); those extras are trimmed by pickFields() afterwards.
+   */
+  private buildSelect(fields: string[], relations: Record<string, any>): Record<string, any> {
+    const select: Record<string, any> = {
+      id: true,
+      createdAt: true,
+      tokenDecimals: true,
+      tokenSymbol: true,
+    };
+    for (const f of fields) {
+      select[f] = relations[f] ?? true;
+    }
+    if (relations.favorites) select.favorites = relations.favorites;
+    return select;
+  }
 
   private buildCacheKey(callerStellarAddress: string, filters: Record<string, any>): string {
     const hash = createHash('sha256')

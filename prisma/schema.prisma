@@ -53,6 +53,8 @@ enum NotificationType {
   ARBITER_DECLINED
   TRACKING_UPDATED
   PROOF_REJECTED
+  DEADLINE_EXTENSION_REQUESTED
+  DEADLINE_EXTENSION_DECIDED
 }
 
 enum CommentVisibility {
@@ -64,6 +66,12 @@ enum CommentVisibility {
 enum DisputeRole {
   BUYER
   SUPPLIER
+}
+
+enum ExtensionRequestStatus {
+  PENDING
+  APPROVED
+  DENIED
 }
 
 enum UserRole {
@@ -204,6 +212,42 @@ model Milestone {
 
   @@unique([shipmentId, milestoneIndex])
   @@map("milestones")
+}
+
+/// Proof expected for a milestone (e.g. "bill of lading"). Defined by the
+/// buyer while the milestone is PENDING; ticked off by supplier/logistics (#392).
+model MilestoneChecklistItem {
+  id          String    @id @default(uuid())
+  milestoneId String
+  label       String    @db.VarChar(200)
+  required    Boolean   @default(true)
+  completedAt DateTime?
+  completedBy String?   // Stellar address
+  createdAt   DateTime  @default(now())
+
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  @@index([milestoneId])
+  @@map("milestone_checklist_items")
+}
+
+/// Supplier/logistics request to move a milestone's dueAt; decided by the buyer (#393).
+model DeadlineExtensionRequest {
+  id            String                 @id @default(uuid())
+  milestoneId   String
+  requestedBy   String                 // Stellar address
+  proposedDueAt DateTime
+  previousDueAt DateTime?
+  reason        String                 @db.VarChar(1000)
+  status        ExtensionRequestStatus @default(PENDING)
+  decidedAt     DateTime?
+  decidedBy     String?                // Stellar address
+  createdAt     DateTime               @default(now())
+
+  milestone Milestone @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  @@index([milestoneId, status])
+  @@map("deadline_extension_requests")
 }
 
 model ProofSubmission {
@@ -487,7 +531,7 @@ model ShipmentTemplate {
   logisticsAddress  String?
   arbiterAddress    String?
   tokenAddress      String?
-  milestoneTemplates Json    // array of { name, paymentPercent, dueDays? }
+  milestoneTemplates Json    // array of { name, paymentPercent, dueDays?, checklist?: { label, required? }[] }
   isPublic          Boolean  @default(false)
   deletedAt         DateTime? // soft-delete marker; set by DELETE /shipment-templates/:id (#306)
   createdAt         DateTime @default(now())
