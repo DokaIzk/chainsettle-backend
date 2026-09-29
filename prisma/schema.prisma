@@ -104,15 +104,18 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
-  kycVerifiedAt    DateTime? // when KYC was last approved
-  kycExpiresAt     DateTime? // when the current KYC approval expires (null = no expiry set)
-  kycReminder30dSentAt DateTime? // tracks whether the 30-day expiry reminder was sent
-  kycReminder7dSentAt  DateTime? // tracks whether the 7-day expiry reminder was sent
+  kycVerifiedAt    DateTime?
+  kycExpiresAt     DateTime?
+  kycReminder30dSentAt DateTime?
+  kycReminder7dSentAt  DateTime?
   phoneNumber      String?   // E.164 format (e.g., +14155551234)
   phoneVerified    Boolean   @default(false)
   pendingPhone     String?   // pending verification change
-  organizationName String?   @db.VarChar(200) // legal entity or trading name, max 200 chars
-  countryCode      String?   @db.Char(2)      // ISO 3166-1 alpha-2 (e.g., "US", "DE")
+  /// Preferred display currency for converted shipment values.
+  /// Validated against SUPPORTED_CURRENCIES in FxRateService.
+  /// Defaults to 'USD' so existing users see no behaviour change.
+  displayCurrency  String    @default("USD")
+
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -137,6 +140,9 @@ model User {
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
   announcementDismissals AnnouncementDismissal[]
+  contacts           Contact[]
+  shipmentReminders ShipmentReminder[] @relation("ShipmentReminders")
+  recurringSchedules RecurringSchedule[] @relation("RecurringSchedules")
 
   @@index([kycExpiresAt])
   @@map("users")
@@ -233,6 +239,23 @@ model Shipment {
   @@map("shipments")
 }
 
+model Contact {
+  id             String   @id @default(uuid())
+  ownerId        String
+  stellarAddress String
+  label          String
+  defaultRole    UserRole?
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@unique([ownerId, stellarAddress])
+  @@index([ownerId, label])
+  @@map("contacts")
+}
+
 model Milestone {
   id                 String          @id @default(uuid())
   shipmentId         String
@@ -257,6 +280,8 @@ model Milestone {
   disputeEvidence DisputeEvidence[]
   proofSubmissions ProofSubmission[]
   settlementProposals SettlementProposal[]
+  checklistItems MilestoneChecklistItem[]
+  extensionRequests DeadlineExtensionRequest[]
 
   @@unique([shipmentId, milestoneIndex])
   @@index([dueAt])
@@ -366,17 +391,17 @@ model Notification {
   title      String
   message    String
   data       Json?            // extra context (shipmentId, amount, etc.)
-  read       Boolean          @default(false)
-  emailSent  Boolean          @default(false)
+  read         Boolean          @default(false)
+  emailSent    Boolean          @default(false)
   deliverAfter DateTime?
-  createdAt  DateTime         @default(now())
+  snoozedUntil DateTime?        // set by the user; excluded from list while snoozedUntil > now()
+  createdAt    DateTime         @default(now())
 
   // Relations
   user User @relation(fields: [userId], references: [id])
 
   @@index([userId])
   @@index([read])
-  @@index([(data->>'shipmentId')])
   @@map("notifications")
 }
 
@@ -408,6 +433,33 @@ model EventCursor {
   updatedAt           DateTime @updatedAt
 
   @@map("event_cursors")
+}
+
+enum BackfillStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Tracks a single admin-initiated ledger-range event backfill.
+/// Only one row may be in PENDING or RUNNING state at a time.
+model BackfillRun {
+  id             String        @id @default(uuid())
+  status         BackfillStatus @default(PENDING)
+  fromLedger     Int
+  toLedger       Int
+  processedCount Int           @default(0)  // events successfully processed
+  errorCount     Int           @default(0)  // events that failed handler execution
+  currentLedger  Int?                       // last ledger polled (progress indicator)
+  errorSummary   Json?                      // array of { ledger, txHash, eventName, error }
+  startedAt      DateTime      @default(now())
+  completedAt    DateTime?
+  initiatedBy    String?                    // Stellar address of the admin who triggered it
+
+  @@index([status])
+  @@index([startedAt])
+  @@map("backfill_runs")
 }
 
 model FailedEvent {

@@ -54,6 +54,8 @@ import { parseFields, SHIPMENT_LIST_FIELDS, SHIPMENT_DETAIL_FIELDS } from './shi
 import { RedisService } from '../../common/redis/redis.service';
 import { ShipmentRemindersService } from './shipment-reminders.service';
 import { CreateShipmentReminderDto } from './dto/shipment-reminder.dto';
+import { AuthService } from '../auth/auth.service';
+import { SUPPORTED_CURRENCIES } from '../../common/fx/fx-rate.service';
 
 @ApiTags('shipments')
 @ApiBearerAuth()
@@ -66,6 +68,7 @@ export class ShipmentsController {
     private readonly savedFilters: SavedFiltersService,
     private readonly redis: RedisService,
     private readonly reminders: ShipmentRemindersService,
+    private readonly authService: AuthService,
   ) { }
 
   /**
@@ -169,6 +172,11 @@ export class ShipmentsController {
 
     const fields = parseFields(query.fields, SHIPMENT_LIST_FIELDS);
 
+    // Currency resolution: ?currency= overrides the user's saved preference.
+    // Users without a stored preference fall back to 'USD'.
+    const userCurrency = await this.authService.getUserDisplayCurrency(user?.id);
+    const displayCurrency = query.currency ?? userCurrency;
+
     return this.shipmentsService.findAllCached({
       buyerAddress: isAdmin ? query.buyerAddress : undefined,
       supplierAddress: isAdmin ? query.supplierAddress : undefined,
@@ -190,6 +198,7 @@ export class ShipmentsController {
       favorite: query.favorite,
       callerUserId: user?.id,
       fields,
+      displayCurrency,
     });
   }
 
@@ -413,16 +422,20 @@ export class ShipmentsController {
   @ApiResponse({ status: 404, description: 'Shipment not found' })
   @ApiQuery({ name: 'precision', required: false, type: Number, description: 'Override decimal places for FX-converted values (e.g. 0 for JPY, 2 for USD). Defaults to currency-appropriate value.' })
   @ApiQuery({ name: 'fields', required: false, type: String, description: `Comma-separated sparse fieldset; id is always included. Valid: ${SHIPMENT_DETAIL_FIELDS.join(', ')}` })
+  @ApiQuery({ name: 'currency', required: false, type: String, description: `Override display currency for FX-converted values on this request. Supported: ${SUPPORTED_CURRENCIES.join(', ')}. Defaults to the user's saved preference.` })
   @ApiResponse({ status: 400, description: 'Unknown field requested' })
-  findOne(
+  async findOne(
     @Param('id') id: string,
     @CurrentUser() user: any,
     @Query('precision') precision?: string,
     @Query('fields') fieldsRaw?: string,
+    @Query('currency') currencyOverride?: string,
   ) {
     const precisionOverride = precision !== undefined ? parseInt(precision, 10) : undefined;
     const fields = parseFields(fieldsRaw, SHIPMENT_DETAIL_FIELDS);
-    return this.shipmentsService.findOne(id, user?.id, precisionOverride, fields);
+    const userCurrency = await this.authService.getUserDisplayCurrency(user?.id);
+    const displayCurrency = currencyOverride?.toUpperCase() ?? userCurrency;
+    return this.shipmentsService.findOne(id, user?.id, precisionOverride, fields, displayCurrency);
   }
 
   /**

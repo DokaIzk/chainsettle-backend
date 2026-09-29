@@ -11,6 +11,9 @@ export class FxRateJob {
   @Cron('*/5 * * * *')
   async refresh() {
     this.logger.debug('Refreshing FX rates');
-    await this.fxRate.refreshAllRates();
+    await Promise.all([
+      this.fxRate.refreshAllRates(),
+      this.fxRate.refreshFiatRates(),
+    ]);
   }
 }

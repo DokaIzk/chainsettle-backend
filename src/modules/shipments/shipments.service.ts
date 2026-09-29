@@ -268,6 +268,8 @@ export class ShipmentsService {
     callerUserId?: string;
     /** Sparse fieldset (#390), already validated by parseFields(). */
     fields?: string[];
+    /** ISO-4217 display currency for FX-converted values. Defaults to 'USD'. */
+    displayCurrency?: string;
   }) {
     const {
       buyerAddress,
@@ -290,6 +292,7 @@ export class ShipmentsService {
       favorite,
       callerUserId,
       fields,
+      displayCurrency = 'USD',
     } = filters;
 
     if (cursor && page && page !== 1) {
@@ -475,7 +478,7 @@ export class ShipmentsService {
     return {
       data: await Promise.all(
         shipments.map(async (s) => {
-          const serialized = await this.serialize(s, callerUserId);
+          const serialized = await this.serialize(s, callerUserId, undefined, displayCurrency);
           return fields ? pickFields(serialized, fields) : serialized;
         }),
       ),
@@ -491,7 +494,7 @@ export class ShipmentsService {
     };
   }
 
-  async findOne(id: string, callerUserId?: string, precisionOverride?: number, fields?: string[]) {
+  async findOne(id: string, callerUserId?: string, precisionOverride?: number, fields?: string[], displayCurrency = 'USD') {
     const db = this.prisma.read;
     const relations = {
       milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } },
@@ -507,7 +510,7 @@ export class ShipmentsService {
       ...(fields ? { select: this.buildSelect(fields, relations) } : { include: relations }),
     } as any);
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
-    const serialized = await this.serialize(shipment, callerUserId, precisionOverride);
+    const serialized = await this.serialize(shipment, callerUserId, precisionOverride, displayCurrency);
     return fields ? pickFields(serialized, fields) : serialized;
   }
 
@@ -2448,36 +2451,38 @@ export class ShipmentsService {
     await this.redis.delByPrefix(`shipments:${callerStellarAddress}:`);
   }
 
-  private async serialize(shipment: any, callerUserId?: string, precisionOverride?: number) {
+  private async serialize(shipment: any, callerUserId?: string, precisionOverride?: number, displayCurrency = 'USD') {
     const now = new Date();
     const decimals: number = shipment.tokenDecimals ?? 7;
     const symbol: string = shipment.tokenSymbol ?? 'USDC';
+    const currency = displayCurrency.toUpperCase();
 
-    // Estimated USD value (#231) — omitted entirely when no rate is cached,
-    // never causes the response to fail.
-    const fxRate = await this.fxRate.getUsdRate(symbol);
-    // Default display currency is USD (the rate is always token → USD).
-    const displayCurrency = 'USD';
-    const estimatedUsdValue = fxRate
-      ? {
-          totalAmountUsd: this.fxRate.formatValue(
-            Number(this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals)),
-            fxRate.rate,
-            displayCurrency,
-            precisionOverride,
-          ),
-          releasedAmountUsd: this.fxRate.formatValue(
-            Number(this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals)),
-            fxRate.rate,
-            displayCurrency,
-            precisionOverride,
-          ),
-          precision: precisionOverride ?? this.fxRate.getDisplayPrecision(displayCurrency),
-          currency: displayCurrency,
-          rate: fxRate.rate,
-          asOf: fxRate.asOf,
-          estimate: true,
-        }
+    // Estimated display-currency value (#231 / displayCurrency).
+    // Uses convertForDisplay which handles token→USD then USD→target cross-rate.
+    // Omitted entirely when no FX rate is cached — never causes the response to fail.
+    // Fetch both rates once and reuse for totalAmount and releasedAmount.
+    const [tokenUsdRate, fiatRate] = await Promise.all([
+      this.fxRate.getUsdRate(symbol),
+      this.fxRate.getFiatRate(currency),
+    ]);
+
+    const estimatedUsdValue = (tokenUsdRate && fiatRate)
+      ? (() => {
+          const effectiveRate = tokenUsdRate.rate * fiatRate.rate;
+          const totalHuman = Number(this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals));
+          const releasedHuman = Number(this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals));
+          const precision = precisionOverride ?? this.fxRate.getDisplayPrecision(currency);
+          const asOf = tokenUsdRate.asOf < fiatRate.asOf ? tokenUsdRate.asOf : fiatRate.asOf;
+          return {
+            totalAmountUsd: this.fxRate.formatValue(totalHuman, effectiveRate, currency, precisionOverride),
+            releasedAmountUsd: this.fxRate.formatValue(releasedHuman, effectiveRate, currency, precisionOverride),
+            precision,
+            currency,
+            rate: effectiveRate,
+            asOf,
+            estimate: true,
+          };
+        })()
       : undefined;
 
     const trackingUpdates = shipment.trackingUpdates?.map((t: any) => ({

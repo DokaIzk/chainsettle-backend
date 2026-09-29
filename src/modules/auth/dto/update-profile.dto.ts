@@ -1,6 +1,7 @@
-import { IsOptional, IsString, IsEmail, MaxLength } from 'class-validator';
+import { IsOptional, IsString, IsEmail, MaxLength, IsIn } from 'class-validator';
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsISO31661Alpha2 } from '../../../common/validators/is-iso-3166-1-alpha2.validator';
+import { Transform } from 'class-transformer';
+import { SUPPORTED_CURRENCIES } from '../../../common/fx/fx-rate.service';
 
 export class UpdateProfileDto {
   @ApiPropertyOptional({ example: 'John Doe', description: 'User display name' })
@@ -15,20 +16,16 @@ export class UpdateProfileDto {
   email?: string;
 
   @ApiPropertyOptional({
-    example: 'Acme Logistics Ltd',
-    description: 'Legal entity or trading name of the organisation (max 200 characters)',
-    maxLength: 200,
+    example: 'EUR',
+    description:
+      'Preferred display currency for converted shipment values. ' +
+      `Supported: ${SUPPORTED_CURRENCIES.join(', ')}. Defaults to USD.`,
+    enum: SUPPORTED_CURRENCIES,
   })
   @IsOptional()
-  @IsString()
-  @MaxLength(200)
-  organizationName?: string;
-
-  @ApiPropertyOptional({
-    example: 'US',
-    description: 'ISO 3166-1 alpha-2 country code of the organisation jurisdiction (e.g. "US", "DE")',
+  @Transform(({ value }) => (typeof value === 'string' ? value.toUpperCase() : value))
+  @IsIn([...SUPPORTED_CURRENCIES], {
+    message: `displayCurrency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
   })
-  @IsOptional()
-  @IsISO31661Alpha2()
-  countryCode?: string;
+  displayCurrency?: string;
 }
