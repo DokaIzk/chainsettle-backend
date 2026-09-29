@@ -1,7 +1,8 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
-import { IsBoolean, IsISO8601, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsISO8601, IsOptional, IsString, IsIn } from 'class-validator';
 import { ShipmentStatus } from '@prisma/client';
+import { SUPPORTED_CURRENCIES } from '../../common/fx/fx-rate.service';
 
 export class FindAllShipmentsDto {
   @ApiPropertyOptional({ description: 'Filter by buyer wallet address' })
@@ -128,4 +129,19 @@ export class FindAllShipmentsDto {
   @IsBoolean()
   @Transform(({ value }) => value === 'true' || value === true)
   favorite?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      `Override the display currency for FX-converted values on this request. ` +
+      `Supported: ${SUPPORTED_CURRENCIES.join(', ')}. ` +
+      `Defaults to the user's saved displayCurrency preference (or USD if unset).`,
+    enum: SUPPORTED_CURRENCIES,
+    example: 'EUR',
+  })
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.toUpperCase() : value))
+  @IsIn([...SUPPORTED_CURRENCIES], {
+    message: `currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
+  })
+  currency?: string;
 }
