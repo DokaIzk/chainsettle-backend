@@ -21,6 +21,7 @@ import { FxModule } from './common/fx/fx.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
 import { ShipmentTemplatesModule } from './modules/shipment-templates/shipment-templates.module';
+import { RecurringSchedulesModule } from './modules/recurring-schedules/recurring-schedules.module';
 import { MilestonesModule } from './modules/milestones/milestones.module';
 import { EventsModule } from './modules/events/events.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -35,13 +36,8 @@ import { ArbitersModule } from './modules/arbiters/arbiters.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
 import { GraphqlModule } from './modules/graphql/graphql.module';
 import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
-import { OrganizationsModule } from './modules/organizations/organizations.module';
-import { EmailModule } from './modules/email/email.module';
-import { ImpersonationGuard } from './common/guards/impersonation.guard';
-import { DeprecationInterceptor } from './common/interceptors/deprecation.interceptor';
-import { HttpExceptionFilter } from './common/filters/http-exception.filter';
-import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
-import { LocaleMiddleware } from './i18n/locale.middleware';
+import { AdminDisputesModule } from './modules/admin-dashboard/admin-disputes.module';
+import { SettlementProposalsModule } from './modules/milestones/settlement-proposals.module';
 
 @Module({
   imports: [
@@ -88,6 +84,7 @@ import { LocaleMiddleware } from './i18n/locale.middleware';
     AuthModule,
     ShipmentsModule,
     ShipmentTemplatesModule,
+    RecurringSchedulesModule,
     MilestonesModule,
     EventsModule,
     NotificationsModule,
@@ -100,8 +97,8 @@ import { LocaleMiddleware } from './i18n/locale.middleware';
     FeatureFlagsModule,
     GraphqlModule,
     AdminDashboardModule,
-    OrganizationsModule,
-    EmailModule,
+    AdminDisputesModule,
+    SettlementProposalsModule,
   ],
   providers: [
     // Apply global throttler guard (sets X-RateLimit-* on success and 429)

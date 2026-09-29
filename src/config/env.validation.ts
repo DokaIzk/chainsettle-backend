@@ -99,6 +99,11 @@ export const envValidationSchema = Joi.object({
   // Shipments at or above this value may require multi-signature approval (#234)
   MULTISIG_VALUE_THRESHOLD_STROOPS: Joi.string().default('1000000000000'), // 100,000 USDC at 7 decimals
   KYC_WEBHOOK_SECRET: Joi.string().allow('').default(''),
+  // How long a VERIFIED KYC status remains valid before re-verification is required (#429).
+  KYC_VALIDITY_DAYS: Joi.number().integer().min(1).default(365),
+  // GraphQL cost controls (#432)
+  GRAPHQL_MAX_DEPTH: Joi.number().integer().min(1).default(7),
+  GRAPHQL_MAX_COMPLEXITY: Joi.number().integer().min(1).default(1000),
 
   // FX rate service (#231)
   FX_RATE_API_URL: Joi.string().uri().allow('').optional(),

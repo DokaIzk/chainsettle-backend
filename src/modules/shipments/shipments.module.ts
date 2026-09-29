@@ -5,6 +5,8 @@ import { ShipmentsService } from './shipments.service';
 import { ShipmentApprovalsService } from './shipment-approvals.service';
 import { SavedFiltersService } from './saved-filters.service';
 import { ShipmentArchivalJob } from './shipment-archival.job';
+import { ShipmentRemindersService } from './shipment-reminders.service';
+import { ShipmentReminderJob } from './shipment-reminder.job';
 import { CommentsController } from './comments.controller';
 import { CommentsService } from './comments.service';
 import { AuditLogsModule } from '../audit-logs/audit-logs.module';
@@ -14,7 +16,7 @@ import { RedisModule } from '../../common/redis/redis.module';
 @Module({
   imports: [NotificationsModule, RedisModule, AuditLogsModule],
   controllers: [ShipmentsController, AdminShipmentsController, CommentsController],
-  providers: [ShipmentsService, ShipmentApprovalsService, SavedFiltersService, CommentsService, ShipmentArchivalJob],
+  providers: [ShipmentsService, ShipmentApprovalsService, SavedFiltersService, CommentsService, ShipmentArchivalJob, ShipmentRemindersService, ShipmentReminderJob],
   exports: [ShipmentsService, ShipmentApprovalsService, SavedFiltersService],
 })
 export class ShipmentsModule { }

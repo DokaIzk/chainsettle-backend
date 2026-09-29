@@ -1,27 +1,29 @@
-import { Resolver, Query, Args, ID, ResolveField, Parent } from '@nestjs/graphql';
+import { Resolver, Query, Args, ID, ResolveField, Parent, Context } from '@nestjs/graphql';
 import { UseGuards } from '@nestjs/common';
 import { ShipmentGql, MilestoneGql, ChainEventGql } from './shipment.type';
 import { ShipmentsService } from '../shipments/shipments.service';
-import { MilestonesService } from '../milestones/milestones.service';
 import { EventsService } from '../events/events.service';
 import { GqlJwtAuthGuard } from './gql-jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { GqlLoaders } from './graphql.loaders';
+import { assertParticipant } from './graphql.access';
+import { toMilestoneGql } from './milestone.mapper';
 
 @Resolver(() => ShipmentGql)
 @UseGuards(GqlJwtAuthGuard)
 export class ShipmentResolver {
   constructor(
-    private readonly shipments: ShipmentsService,
-    private readonly milestones: MilestonesService,
+    private readonly shipmentsService: ShipmentsService,
     private readonly events: EventsService,
   ) {}
 
   @Query(() => ShipmentGql, { description: 'Fetch a shipment with its milestones and recent events' })
   async shipment(
     @Args('id', { type: () => ID }) id: string,
-    @CurrentUser('id') userId: string,
+    @CurrentUser() user: any,
   ): Promise<ShipmentGql> {
-    const s = await this.shipments.findOne(id, userId);
+    const s = await this.shipmentsService.findOne(id, user?.id);
+    assertParticipant(s as any, user);
     return this.toGql(s);
   }
 
@@ -32,7 +34,7 @@ export class ShipmentResolver {
     @Args('page', { nullable: true, type: () => Number }) page?: number,
     @Args('limit', { nullable: true, type: () => Number }) limit?: number,
   ): Promise<ShipmentGql[]> {
-    const result = await this.shipments.findAll({
+    const result = await this.shipmentsService.findAll({
       callerStellarAddress: user.stellarAddress,
       callerUserId: user.id,
       status: status as any,
@@ -43,9 +45,14 @@ export class ShipmentResolver {
   }
 
   @ResolveField(() => [MilestoneGql])
-  async milestones(@Parent() shipment: ShipmentGql): Promise<MilestoneGql[]> {
-    if (shipment.milestones?.length) return shipment.milestones;
-    return this.milestones.findByShipment(shipment.id);
+  async milestones(
+    @Parent() shipment: ShipmentGql,
+    @Context('loaders') loaders: GqlLoaders,
+  ): Promise<MilestoneGql[]> {
+    // Batched through DataLoader so listing shipments doesn't fan out into
+    // one milestone query per shipment (#430).
+    const rows = await loaders.milestonesByShipment.load(shipment.id);
+    return rows.map(toMilestoneGql);
   }
 
   @ResolveField(() => [ChainEventGql])
@@ -68,7 +75,7 @@ export class ShipmentResolver {
       description: s.description ?? undefined,
       referenceNumber: s.referenceNumber ?? undefined,
       createdAt: s.createdAt,
-      milestones: s.milestones ?? [],
+      milestones: [],
       recentEvents: s.events ?? [],
     };
   }

@@ -81,6 +81,8 @@ All endpoints are prefixed with `/api/v1` (URI versioning; see [API Versioning](
 > Database schema reference (ERD + tables): [docs/database.md](./docs/database.md)
 >
 > Typed TypeScript SDK: [sdk/](./sdk/) — regenerate with `npm run generate:sdk`
+>
+> 🔄 **Idempotency**: Learn how to safely retry network requests using the `Idempotency-Key` header in [docs/idempotency.md](./docs/idempotency.md).
 
 ### Auth
 | Method | Path | Description |
@@ -112,6 +114,8 @@ All endpoints are prefixed with `/api/v1` (URI versioning; see [API Versioning](
 | `GET` | `/events` | ✓ | List chain events (filter by shipmentId) |
 
 ### Notifications
+> ⚡ WebSocket Gateway: Real-time notifications and chain events. See [docs/websockets.md](./docs/websockets.md).
+
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/notifications` | ✓ | Get user notifications |
@@ -424,7 +428,7 @@ Errors follow a standardised format from `HttpExceptionFilter`:
 }
 ```
 
-Send `Accept-Language: es` to receive Spanish error messages for mapped strings (falls back to English). See [`src/i18n/README.md`](src/i18n/README.md).
+Send `Accept-Language: es` or append `?lang=es` to receive Spanish error messages for mapped strings (falls back to English). See [`docs/i18n.md`](docs/i18n.md).
 
 ---
 

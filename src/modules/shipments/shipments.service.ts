@@ -6,6 +6,7 @@ import {
   ForbiddenException,
   BadRequestException,
   InternalServerErrorException,
+  PreconditionFailedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash } from 'crypto';
@@ -27,6 +28,28 @@ import { randomUUID } from 'crypto';
 import { parse } from 'csv-parse/sync';
 import Ajv from 'ajv';
 import { metadataSchemas } from './schemas/metadata.schemas';
+import { pickFields } from './shipment-fields';
+
+const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Strong ETag for a shipment's mutable state (#387). Derived from id and
+ * updatedAt so every successful write produces a new value.
+ */
+export function shipmentEtag(shipment: { id: string; updatedAt: Date }): string {
+  const hash = createHash('sha1')
+    .update(`${shipment.id}:${new Date(shipment.updatedAt).toISOString()}`)
+    .digest('hex');
+  return `"${hash}"`;
+}
+
+/** True when an If-Match header value matches the current ETag (or is `*`). */
+export function ifMatchSatisfied(ifMatch: string, currentEtag: string): boolean {
+  return ifMatch
+    .split(',')
+    .map((v) => v.trim().replace(/^W\//, ''))
+    .some((v) => v === '*' || v === currentEtag);
+}
 
 import { computeFieldChanges, extractChanges, isHiddenField } from './shipment-diff.util';
 
@@ -105,7 +128,9 @@ export class ShipmentsService {
     const tokenAddress = dto.tokenAddress ?? templateData.tokenAddress;
     const milestones = dto.milestones ?? templateData.milestones;
 
-    // Validate required fields
+    if (arbiterAddress && [dto.buyerAddress, supplierAddress, logisticsAddress].some(a => a && a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+
+        // Validate required fields
     if (!supplierAddress || !logisticsAddress || !arbiterAddress || !tokenAddress || !milestones) {
       throw new ConflictException(
         'Missing required fields: supplierAddress, logisticsAddress, arbiterAddress, tokenAddress, milestones',
@@ -184,6 +209,17 @@ export class ShipmentsService {
             paymentPercent: m.paymentPercent,
             ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
             ...(m.dueDays ? { dueAt: new Date(Date.now() + m.dueDays * 24 * 60 * 60 * 1000) } : {}),
+            // Template checklists (#392) become real checklist items.
+            ...(Array.isArray(m.checklist) && m.checklist.length > 0
+              ? {
+                  checklistItems: {
+                    create: m.checklist.map((c: any) => ({
+                      label: String(c.label),
+                      required: c.required ?? true,
+                    })),
+                  },
+                }
+              : {}),
           })),
         },
       },
@@ -203,7 +239,7 @@ export class ShipmentsService {
     this.metrics.incrementShipmentsCreated();
     this.metrics.incrementActiveShipments();
     await this.invalidateUserCache(dto.buyerAddress);
-    return await this.serialize(shipment);
+    return { ...(await this.serialize(shipment)), warnings: await this.getArbiterWarnings(arbiterAddress, dto.buyerAddress, supplierAddress) };
   }
 
   // ----------------------------------------------------------
@@ -230,8 +266,8 @@ export class ShipmentsService {
     isDraft?: boolean;
     favorite?: boolean;
     callerUserId?: string;
-    /** Org view (#435): scope to shipments with any of these participants. */
-    participantAddresses?: string[];
+    /** Sparse fieldset (#390), already validated by parseFields(). */
+    fields?: string[];
   }) {
     const {
       buyerAddress,
@@ -253,7 +289,7 @@ export class ShipmentsService {
       isDraft,
       favorite,
       callerUserId,
-      participantAddresses,
+      fields,
     } = filters;
 
     if (cursor && page && page !== 1) {
@@ -327,6 +363,13 @@ export class ShipmentsService {
       ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
       : {};
 
+    // Sparse fieldsets (#390): push the selection into Prisma rather than
+    // trimming afterwards. When no fields are requested, keep the full include.
+    const milestonesQuery = { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } };
+    const projection: any = fields
+      ? { select: this.buildSelect(fields, { milestones: milestonesQuery, ...favoriteInclude }) }
+      : { include: { milestones: milestonesQuery, ...favoriteInclude } };
+
     let shipments: any[];
     let total: number | null = null;
     let nextCursor: string | null = null;
@@ -375,10 +418,12 @@ export class ShipmentsService {
       total = Number((countResult as any[])[0].count);
 
       for (const s of shipments) {
-        s.milestones = await db.milestone.findMany({
-          where: { shipmentId: s.id, deletedAt: null },
-          orderBy: { milestoneIndex: 'asc' },
-        });
+        if (!fields || fields.includes('milestones')) {
+          s.milestones = await db.milestone.findMany({
+            where: { shipmentId: s.id, deletedAt: null },
+            orderBy: { milestoneIndex: 'asc' },
+          });
+        }
         if (callerUserId) {
           s.favorites = await this.prisma.shipmentFavorite.findMany({
             where: { shipmentId: s.id, userId: callerUserId },
@@ -397,10 +442,7 @@ export class ShipmentsService {
       const db = this.prisma.read;
       shipments = await db.shipment.findMany({
         where: { ...where, createdAt: { lte: new Date(decoded.createdAt) } },
-        include: {
-          milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-          ...favoriteInclude,
-        },
+        ...projection,
         orderBy: { createdAt: 'desc' },
         cursor: { id: decoded.id },
         skip: 1,
@@ -421,10 +463,7 @@ export class ShipmentsService {
       [shipments, total] = await db.$transaction([
         db.shipment.findMany({
           where,
-          include: {
-            milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-            ...favoriteInclude,
-          },
+          ...projection,
           orderBy: { createdAt: 'desc' },
           skip: (page - 1) * limit,
           take: limit,
@@ -435,7 +474,10 @@ export class ShipmentsService {
 
     return {
       data: await Promise.all(
-        shipments.map((s) => this.serialize(s, callerUserId)),
+        shipments.map(async (s) => {
+          const serialized = await this.serialize(s, callerUserId);
+          return fields ? pickFields(serialized, fields) : serialized;
+        }),
       ),
       meta: cursor
         ? { nextCursor, limit }
@@ -449,22 +491,50 @@ export class ShipmentsService {
     };
   }
 
-  async findOne(id: string, callerUserId?: string, precisionOverride?: number) {
+  async findOne(id: string, callerUserId?: string, precisionOverride?: number, fields?: string[]) {
     const db = this.prisma.read;
-    const shipment = await db.shipment.findUnique({
+    const relations = {
+      milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } },
+      events: { orderBy: { ledger: 'desc' as const }, take: 20 },
+      trackingUpdates: { orderBy: { createdAt: 'asc' as const } },
+      approvals: { orderBy: { createdAt: 'asc' as const } },
+      ...(callerUserId
+        ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
+        : {}),
+    };
+    const shipment: any = await db.shipment.findUnique({
       where: { id },
-      include: {
-        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
-        events: { orderBy: { ledger: 'desc' }, take: 20 },
-        trackingUpdates: { orderBy: { createdAt: 'asc' } },
-        approvals: { orderBy: { createdAt: 'asc' } },
-        ...(callerUserId
-          ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
-          : {}),
-      },
-    });
+      ...(fields ? { select: this.buildSelect(fields, relations) } : { include: relations }),
+    } as any);
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
-    return this.serialize(shipment, callerUserId, precisionOverride);
+    const serialized = await this.serialize(shipment, callerUserId, precisionOverride);
+    return fields ? pickFields(serialized, fields) : serialized;
+  }
+
+  /**
+   * findAll with a short-lived per-caller Redis cache. The key hashes every
+   * filter — including the sparse fieldset — so different field selections
+   * never share an entry (#390).
+   */
+  async findAllCached(filters: Parameters<ShipmentsService['findAll']>[0]) {
+    const caller = filters.callerStellarAddress;
+    if (!caller || filters.search) return this.findAll(filters);
+
+    const key = this.buildCacheKey(caller, filters);
+    try {
+      const cached = await this.redis.getJson<Awaited<ReturnType<ShipmentsService['findAll']>>>(key);
+      if (cached) return cached;
+    } catch (err) {
+      this.logger.warn(`Shipment list cache read failed: ${(err as Error).message}`);
+    }
+
+    const result = await this.findAll(filters);
+    try {
+      await this.redis.setJson(key, result, this.cacheTtl);
+    } catch (err) {
+      this.logger.warn(`Shipment list cache write failed: ${(err as Error).message}`);
+    }
+    return result;
   }
 
   /**
@@ -664,7 +734,7 @@ export class ShipmentsService {
    * Only the buyer can update a shipment.
    * Financial fields and addresses are immutable and ignored if provided.
    */
-  async update(id: string, buyerAddress: string, dto: any, callerId?: string) {
+  async update(id: string, buyerAddress: string, dto: any, ifMatch?: string) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
     });
@@ -672,6 +742,7 @@ export class ShipmentsService {
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     // Verify buyer is the one making the update
     if (shipment.buyerAddress !== buyerAddress) {
@@ -695,8 +766,7 @@ export class ShipmentsService {
     if (dto.metadata !== undefined) updateData.metadata = dto.metadata;
     if (dto.tags !== undefined) updateData.tags = dto.tags;
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: updateData,
       include: {
         milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
@@ -753,15 +823,17 @@ export class ShipmentsService {
     tags: string[] | undefined,
     callerAddress?: string,
     callerId?: string,
+    ifMatch?: string,
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
-      select: { id: true, tags: true },
+      select: { id: true, tags: true, updatedAt: true },
     });
 
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     if (!Array.isArray(tags)) {
       throw new BadRequestException('tags must be an array');
@@ -790,8 +862,7 @@ export class ShipmentsService {
 
     const nextTags = Array.from(normalizedTags.values());
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: { tags: nextTags },
       include: {
         milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
@@ -814,6 +885,122 @@ export class ShipmentsService {
 
     this.logger.log(`Shipment tags replaced: ${id}`);
     return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // OPTIMISTIC CONCURRENCY (#387)
+  // ----------------------------------------------------------
+
+  /** Returns the current ETag for a shipment. */
+  async getEtag(id: string): Promise<string> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { id: true, updatedAt: true },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    return shipmentEtag(shipment);
+  }
+
+  private assertIfMatch(shipment: { id: string; updatedAt: Date }, ifMatch?: string) {
+    if (ifMatch === undefined || ifMatch === null || ifMatch === '') {
+      if (this.config.get<string>('SHIPMENT_REQUIRE_IF_MATCH') === 'true') {
+        throw new PreconditionFailedException('If-Match header is required');
+      }
+      return;
+    }
+    if (!ifMatchSatisfied(ifMatch, shipmentEtag(shipment))) {
+      throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+    }
+  }
+
+  /**
+   * Updates a shipment, and when an If-Match was supplied also pins the write
+   * to the updatedAt that was checked so a concurrent writer that slipped in
+   * between the read and the write causes a 412 instead of a lost update.
+   */
+  private async conditionalUpdate(
+    shipment: { id: string; updatedAt: Date },
+    ifMatch: string | undefined,
+    args: { data: any; include?: any },
+  ) {
+    const where: any = ifMatch
+      ? { id: shipment.id, updatedAt: shipment.updatedAt }
+      : { id: shipment.id };
+    try {
+      return await this.prisma.shipment.update({ where, ...args });
+    } catch (err: any) {
+      if (ifMatch && err?.code === 'P2025') {
+        throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+      }
+      throw err;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // DUPLICATE CHECK (#388)
+  // ----------------------------------------------------------
+
+  /**
+   * Finds the caller's ACTIVE shipments that look like duplicates of a
+   * shipment about to be created. Read-only.
+   */
+  async findPossibleDuplicates(
+    buyerAddress: string,
+    dto: { supplierAddress?: string; tokenAddress?: string; totalAmount?: string; referenceNumber?: string },
+  ) {
+    const since = new Date(Date.now() - DUPLICATE_WINDOW_MS);
+    let amount: bigint | undefined;
+    try {
+      amount = dto.totalAmount !== undefined ? BigInt(dto.totalAmount) : undefined;
+    } catch {
+      throw new BadRequestException('totalAmount must be an integer string');
+    }
+
+    const or: any[] = [];
+    if (dto.supplierAddress && dto.tokenAddress && amount !== undefined) {
+      or.push({
+        supplierAddress: dto.supplierAddress,
+        tokenAddress: dto.tokenAddress,
+        totalAmount: amount,
+        createdAt: { gte: since },
+      });
+    }
+    if (dto.referenceNumber) {
+      or.push({ referenceNumber: dto.referenceNumber });
+    }
+    if (or.length === 0) return { possibleDuplicates: [] };
+
+    const matches = await this.prisma.shipment.findMany({
+      where: { buyerAddress, status: ShipmentStatus.ACTIVE, OR: or },
+      select: {
+        id: true,
+        createdAt: true,
+        referenceNumber: true,
+        supplierAddress: true,
+        tokenAddress: true,
+        totalAmount: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return {
+      possibleDuplicates: matches.map((m) => {
+        const matchReasons: string[] = [];
+        if (
+          amount !== undefined &&
+          m.supplierAddress === dto.supplierAddress &&
+          m.tokenAddress === dto.tokenAddress &&
+          BigInt(m.totalAmount) === amount &&
+          m.createdAt >= since
+        ) {
+          matchReasons.push('SAME_SUPPLIER_TOKEN_AMOUNT_WITHIN_7_DAYS');
+        }
+        if (dto.referenceNumber && m.referenceNumber === dto.referenceNumber) {
+          matchReasons.push('SAME_REFERENCE_NUMBER');
+        }
+        return { id: m.id, createdAt: m.createdAt, referenceNumber: m.referenceNumber, matchReasons };
+      }),
+    };
   }
 
   // ----------------------------------------------------------
@@ -982,6 +1169,33 @@ export class ShipmentsService {
   }
 
   // ----------------------------------------------------------
+  private async getArbiterWarnings(arbiterAddress: string, buyerAddress: string, supplierAddress: string): Promise<string[]> {
+    const since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+    const relatedTrade = await this.prisma.shipment.findFirst({ where: { createdAt: { gte: since }, OR: [
+      { buyerAddress: arbiterAddress, supplierAddress: { in: [buyerAddress, supplierAddress] } },
+      { supplierAddress: arbiterAddress, buyerAddress: { in: [buyerAddress, supplierAddress] } },
+    ] }, select: { id: true } });
+    const [total, sameBuyer] = await Promise.all([
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress } } }),
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress, buyerAddress } } }),
+    ]);
+    const threshold = Math.min(1, Math.max(0, Number(process.env.ARBITER_REPEAT_BUYER_WARNING_THRESHOLD ?? 0.5)));
+    const warnings: string[] = [];
+    if (relatedTrade) warnings.push('Arbiter has traded with a shipment party in the last 12 months.');
+    if (total > 0 && sameBuyer / total > threshold) warnings.push(`More than ${Math.round(threshold * 100)}% of this arbiter's past resolutions involved this buyer.`);
+    return warnings;
+  }
+
+  async replaceArbiter(id: string, buyerAddress: string, arbiterAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) throw new ForbiddenException('Only the buyer may replace the arbiter');
+    if (shipment.arbiterStatus === ArbiterStatus.ACCEPTED) throw new ConflictException('An accepted arbiter cannot be replaced');
+    if ([shipment.buyerAddress, shipment.supplierAddress, shipment.logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+    const updated = await this.prisma.shipment.update({ where: { id }, data: { arbiterAddress, arbiterStatus: ArbiterStatus.PENDING_ACCEPTANCE } });
+    await this.notifications.notifyUser(arbiterAddress, NotificationType.ARBITER_INVITED, 'Arbiter assignment invitation', `You have been assigned as arbiter for shipment ${id}.`, { shipmentId: id, buyerAddress, supplierAddress: shipment.supplierAddress });
+    return { ...(await this.serialize(updated)), warnings: await this.getArbiterWarnings(arbiterAddress, buyerAddress, shipment.supplierAddress) };
+  }
   // ARBITER ACCEPT / DECLINE
   // ----------------------------------------------------------
 
@@ -1860,7 +2074,11 @@ export class ShipmentsService {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        milestones: {
+          where: { deletedAt: null },
+          orderBy: { milestoneIndex: 'asc' },
+          include: { proofSubmissions: { orderBy: { createdAt: 'desc' }, take: 1 } },
+        },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
       },
@@ -1908,7 +2126,8 @@ export class ShipmentsService {
           doc.text(
             `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
             (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : '') +
-            (m.proofHash ? ` — Proof: ${m.proofHash}` : ''),
+            (m.proofHash ? ` — Proof: ${m.proofHash}` : '') +
+            (m.proofSubmissions?.[0]?.sha256 ? ` — SHA-256: ${m.proofSubmissions[0].sha256}` : ''),
           );
         }
       }
@@ -2054,6 +2273,8 @@ export class ShipmentsService {
         const description = (r.description ?? '').trim();
         const referenceNumber = (r.referenceNumber ?? r.referencenumber ?? '').trim();
 
+        if (arbiterAddress && [buyerAddress, supplierAddress, logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+
         // Validate required fields
         if (!supplierAddress) throw new Error('supplierAddress is required');
         if (!logisticsAddress) throw new Error('logisticsAddress is required');
@@ -2094,6 +2315,29 @@ export class ShipmentsService {
           throw new Error(`Unknown tokenAddress "${tokenAddress}"`);
         }
 
+        // Parse milestones if provided
+        const milestoneData: { name: string; paymentPercent: number; milestoneIndex: number }[] = [];
+        if (milestonesRaw) {
+          const parts = milestonesRaw.split('|');
+          let sum = 0;
+          for (let idx = 0; idx < parts.length; idx++) {
+            const part = parts[idx];
+            const [name, percentStr] = part.split(':');
+            if (!name || !percentStr) {
+              throw new Error(`Invalid milestone format in "${part}". Expected Name:Percent`);
+            }
+            const percent = parseInt(percentStr.trim(), 10);
+            if (isNaN(percent) || percent <= 0) {
+              throw new Error(`Milestone percentage must be a positive number in "${part}"`);
+            }
+            sum += percent;
+            milestoneData.push({ name: name.trim(), paymentPercent: percent, milestoneIndex: idx });
+          }
+          if (sum !== 100) {
+            throw new Error(`Milestone percentages must sum to 100. Got ${sum}.`);
+          }
+        }
+
         const shipmentId = randomUUID();
 
         const shipment = await this.prisma.shipment.create({
@@ -2110,7 +2354,8 @@ export class ShipmentsService {
             description: description || null,
             referenceNumber: referenceNumber || null,
             isDraft: true,
-            // Draft shipments have no txHash, createdLedger, milestones, or on-chain backing
+            milestones: milestoneData.length > 0 ? { create: milestoneData } : undefined,
+            // Draft shipments have no txHash, createdLedger, or on-chain backing
           },
         });
 
@@ -2153,6 +2398,25 @@ export class ShipmentsService {
   // ----------------------------------------------------------
   // INTERNAL HELPERS
   // ----------------------------------------------------------
+
+  /**
+   * Prisma `select` for a sparse fieldset. Always includes the columns the
+   * serializer needs (id, createdAt for cursors, token decimals/symbol for
+   * amount formatting); those extras are trimmed by pickFields() afterwards.
+   */
+  private buildSelect(fields: string[], relations: Record<string, any>): Record<string, any> {
+    const select: Record<string, any> = {
+      id: true,
+      createdAt: true,
+      tokenDecimals: true,
+      tokenSymbol: true,
+    };
+    for (const f of fields) {
+      select[f] = relations[f] ?? true;
+    }
+    if (relations.favorites) select.favorites = relations.favorites;
+    return select;
+  }
 
   private buildCacheKey(callerStellarAddress: string, filters: Record<string, any>): string {
     const hash = createHash('sha256')
