@@ -104,6 +104,9 @@ model User {
   deactivatedAt    DateTime? // set when the user deactivates their account (soft-delete)
   kycStatus        KycStatus @default(UNVERIFIED)
   kycReference     String?   // opaque verification reference/ID from the KYC provider — never raw identity documents
+  phoneNumber      String?   // E.164 format (e.g., +14155551234)
+  phoneVerified    Boolean   @default(false)
+  pendingPhone     String?   // pending verification change
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -196,6 +199,7 @@ model Milestone {
   overdueNotifiedAt  DateTime?       // timestamp when overdue notification was sent (prevents re-notification)
   overdueReminder3dAt DateTime?       // timestamp when 3-day escalation notification was sent
   disputeEscalatedAt DateTime?       // set when the dispute has been escalated to admins (prevents re-escalation)
+  disputedAt         DateTime?       // when the milestone entered DISPUTED status
   deletedAt          DateTime?       // soft-delete marker; set by DELETE /shipments/:id/milestones/:index (#306)
   createdAt          DateTime        @default(now())
   updatedAt          DateTime        @updatedAt
@@ -204,8 +208,7 @@ model Milestone {
   shipment        Shipment          @relation(fields: [shipmentId], references: [id])
   disputeEvidence DisputeEvidence[]
   proofSubmissions ProofSubmission[]
-  checklistItems  MilestoneChecklistItem[]
-  extensionRequests DeadlineExtensionRequest[]
+  settlementProposals SettlementProposal[]
 
   @@unique([shipmentId, milestoneIndex])
   @@map("milestones")
@@ -313,6 +316,7 @@ model Notification {
   data       Json?            // extra context (shipmentId, amount, etc.)
   read       Boolean          @default(false)
   emailSent  Boolean          @default(false)
+  deliverAfter DateTime?
   createdAt  DateTime         @default(now())
 
   // Relations
@@ -320,9 +324,32 @@ model Notification {
 
   @@index([userId])
   @@index([read])
+  @@index([(data->>'shipmentId')])
   @@map("notifications")
 }
 
+
+enum SettlementProposalStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  WITHDRAWN
+}
+
+model SettlementProposal {
+  id              String                   @id @default(uuid())
+  milestoneId     String
+  proposedBy      String
+  supplierPercent Int
+  message         String?
+  status          SettlementProposalStatus @default(PENDING)
+  respondedAt     DateTime?
+  createdAt       DateTime                 @default(now())
+  milestone       Milestone                @relation(fields: [milestoneId], references: [id], onDelete: Cascade)
+
+  @@index([milestoneId, status])
+  @@map("settlement_proposals")
+}
 model EventCursor {
   id                  String   @id
   lastProcessedLedger Int
@@ -432,8 +459,11 @@ model AuditLog {
 model NotificationPreference {
   id              String   @id @default(uuid())
   userId          String   @unique
-  preferences     Json     // Record<NotificationType, { inApp: boolean; email: boolean; slack: boolean }>
+  preferences     Json     // Record<NotificationType, { inApp: boolean; email: boolean; slack: boolean; sms: boolean; discord: boolean }>
   slackWebhookUrl String?  // Incoming Slack webhook URL; null disables Slack delivery
+  discordWebhookUrl String? // Incoming Discord webhook URL; null disables Discord delivery
+  smsSentCount    Int      @default(0)   // SMS sent this rolling 24h window
+  smsWindowStart  DateTime @default(now()) // Start of current 24h rate-limit window
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
