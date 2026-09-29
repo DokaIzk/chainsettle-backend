@@ -131,6 +131,7 @@ model User {
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
 
+  @@index([kycExpiresAt])
   @@map("users")
 }
 
