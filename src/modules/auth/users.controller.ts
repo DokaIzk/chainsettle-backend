@@ -1,9 +1,10 @@
-import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req } from '@nestjs/common';
+import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req, Param } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { SessionService } from './session.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { RevokeAllSessionsDto } from './dto/revoke-all-sessions.dto';
+import { SetPhoneDto, VerifyPhoneDto } from './dto/verify-phone.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AuditLogService } from '../audit-logs/audit-log.service';
@@ -122,5 +123,37 @@ export class UsersController {
     );
 
     return { revokedCount };
+  }
+
+  /**
+   * POST /users/me/phone
+   *
+   * Initiate phone number verification by sending an OTP.
+   * Accepts a phone number in E.164 format.
+   */
+  @Post('me/phone')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Initiate phone number verification (send OTP)' })
+  @ApiResponse({ status: 200, description: 'Verification code sent' })
+  @ApiResponse({ status: 400, description: 'Invalid phone number format' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  sendPhoneVerification(@CurrentUser('id') userId: string, @Body() dto: SetPhoneDto) {
+    return this.authService.sendPhoneVerificationOtp(userId, dto.phoneNumber);
+  }
+
+  /**
+   * POST /users/me/phone/verify
+   *
+   * Verify phone number with the OTP sent to that number.
+   * On success, the phone number is marked as verified.
+   */
+  @Post('me/phone/verify')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Verify phone number with OTP' })
+  @ApiResponse({ status: 200, description: 'Phone number verified successfully' })
+  @ApiResponse({ status: 400, description: 'Invalid or expired OTP' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  verifyPhone(@CurrentUser('id') userId: string, @Body() dto: VerifyPhoneDto) {
+    return this.authService.verifyPhone(userId, dto.otp);
   }
 }

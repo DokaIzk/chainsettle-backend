@@ -62,6 +62,19 @@ export class CommentsService {
       if (!parent) throw new NotFoundException(`Comment ${dto.parentCommentId} not found`);
     }
 
+    // Milestone-scoped comments (#396) must reference a live milestone.
+    if (dto.milestoneIndex !== undefined && dto.milestoneIndex !== null) {
+      const milestone = await this.prisma.milestone.findFirst({
+        where: { shipmentId, milestoneIndex: dto.milestoneIndex, deletedAt: null },
+        select: { id: true },
+      });
+      if (!milestone) {
+        throw new BadRequestException(
+          `Milestone ${dto.milestoneIndex} does not exist on shipment ${shipmentId}`,
+        );
+      }
+    }
+
     const comment = await this.prisma.shipmentComment.create({
       data: {
         shipmentId,
@@ -70,6 +83,7 @@ export class CommentsService {
         visibility: dto.visibility ?? CommentVisibility.ALL,
         attachmentCid: dto.attachmentCid,
         parentCommentId: dto.parentCommentId ?? null,
+        milestoneIndex: dto.milestoneIndex ?? null,
       },
       include: { author: { select: { id: true, stellarAddress: true, name: true } } },
     });
@@ -108,6 +122,7 @@ export class CommentsService {
     requesterAddress: string,
     page = 1,
     limit = 20,
+    milestoneIndex?: number,
   ) {
     const { shipment, isAdmin } = await this.loadForRead(shipmentId, requesterAddress);
     const visibility = { in: this.buildVisibilityFilter(requesterAddress, shipment, isAdmin) };
@@ -116,6 +131,7 @@ export class CommentsService {
     const where = {
       shipmentId,
       parentCommentId: null,
+      ...(milestoneIndex !== undefined ? { milestoneIndex } : {}),
       visibility,
       OR: [{ deletedAt: null }, { replies: { some: visibleReplies } }],
     };

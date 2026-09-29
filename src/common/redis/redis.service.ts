@@ -49,6 +49,39 @@ export class RedisService implements OnModuleDestroy {
   }
 
   /**
+   * Read and JSON-parse a key. Returns null when missing or unparseable.
+   */
+  async getJson<T>(key: string): Promise<T | null> {
+    const raw = await this.client.get(key);
+    if (raw === null) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * JSON-serialize and store a value. BigInts are written as strings.
+   */
+  async setJson(key: string, value: unknown, ttlSeconds?: number): Promise<void> {
+    const raw = JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+    await this.set(key, raw, ttlSeconds);
+  }
+
+  /**
+   * Delete every key starting with `prefix` (SCAN-based, non-blocking).
+   */
+  async delByPrefix(prefix: string): Promise<void> {
+    let cursor = '0';
+    do {
+      const [next, keys] = await this.client.scan(cursor, 'MATCH', `${prefix}*`, 'COUNT', 100);
+      cursor = next;
+      if (keys.length > 0) await this.client.del(...keys);
+    } while (cursor !== '0');
+  }
+
+  /**
    * Set a key with expiration (in seconds)
    */
   async set(key: string, value: string, ttlSeconds?: number): Promise<void> {
