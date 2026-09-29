@@ -2121,6 +2121,29 @@ export class ShipmentsService {
           throw new Error(`Unknown tokenAddress "${tokenAddress}"`);
         }
 
+        // Parse milestones if provided
+        const milestoneData: { name: string; paymentPercent: number; milestoneIndex: number }[] = [];
+        if (milestonesRaw) {
+          const parts = milestonesRaw.split('|');
+          let sum = 0;
+          for (let idx = 0; idx < parts.length; idx++) {
+            const part = parts[idx];
+            const [name, percentStr] = part.split(':');
+            if (!name || !percentStr) {
+              throw new Error(`Invalid milestone format in "${part}". Expected Name:Percent`);
+            }
+            const percent = parseInt(percentStr.trim(), 10);
+            if (isNaN(percent) || percent <= 0) {
+              throw new Error(`Milestone percentage must be a positive number in "${part}"`);
+            }
+            sum += percent;
+            milestoneData.push({ name: name.trim(), paymentPercent: percent, milestoneIndex: idx });
+          }
+          if (sum !== 100) {
+            throw new Error(`Milestone percentages must sum to 100. Got ${sum}.`);
+          }
+        }
+
         const shipmentId = randomUUID();
 
         const shipment = await this.prisma.shipment.create({
@@ -2137,7 +2160,8 @@ export class ShipmentsService {
             description: description || null,
             referenceNumber: referenceNumber || null,
             isDraft: true,
-            // Draft shipments have no txHash, createdLedger, milestones, or on-chain backing
+            milestones: milestoneData.length > 0 ? { create: milestoneData } : undefined,
+            // Draft shipments have no txHash, createdLedger, or on-chain backing
           },
         });
 
