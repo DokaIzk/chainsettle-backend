@@ -161,6 +161,73 @@ describe('NotificationsService — preferences', () => {
     });
   });
 
+  describe('grouped shipment notifications', () => {
+    it('groups notifications by shipment and returns the newest three in each group', async () => {
+      const prisma = buildPrisma();
+      prisma.notification.findMany.mockResolvedValue([
+        {
+          id: 'n-3',
+          userId: 'user-1',
+          type: NotificationType.PROOF_SUBMITTED,
+          title: 'Proof received',
+          message: 'Third',
+          data: { shipmentId: 'ship-1' },
+          read: false,
+          createdAt: new Date('2024-01-03T00:00:00Z'),
+        },
+        {
+          id: 'n-2',
+          userId: 'user-1',
+          type: NotificationType.DISPUTE_RAISED,
+          title: 'Dispute raised',
+          message: 'Second',
+          data: { shipmentId: 'ship-1' },
+          read: true,
+          createdAt: new Date('2024-01-02T00:00:00Z'),
+        },
+        {
+          id: 'n-1',
+          userId: 'user-1',
+          type: NotificationType.SYSTEM_ALERT,
+          title: 'System alert',
+          message: 'General',
+          data: {},
+          read: false,
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+        },
+      ]);
+      prisma.shipment = { findMany: jest.fn().mockResolvedValue([{ id: 'ship-1', referenceNumber: 'REF-123' }]) };
+
+      const service = await buildService(prisma);
+      const result = await service.findForUser('user-1', false, 1, 20, 'shipment');
+
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0]).toMatchObject({ shipmentId: 'ship-1', referenceNumber: 'REF-123', unreadCount: 1 });
+      expect(result.data[0].notifications).toHaveLength(2);
+      expect(result.data[1].shipmentId).toBeNull();
+    });
+
+    it('marks all notifications for a shipment as read and returns an updated count', async () => {
+      const prisma = buildPrisma();
+      prisma.notification.updateMany.mockResolvedValue({ count: 2 });
+      prisma.notification.count.mockResolvedValue(1);
+      const service = await buildService(prisma);
+
+      const result = await (service as any).markReadByShipment('user-1', 'ship-1');
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: 'user-1',
+            read: false,
+          }),
+          data: { read: true },
+        }),
+      );
+      expect(result).toEqual({ updatedCount: 2 });
+    });
+  });
+
   describe('Slack channel', () => {
     const originalFetch = global.fetch;
 
