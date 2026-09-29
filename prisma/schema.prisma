@@ -107,6 +107,11 @@ model User {
   phoneNumber      String?   // E.164 format (e.g., +14155551234)
   phoneVerified    Boolean   @default(false)
   pendingPhone     String?   // pending verification change
+  /// Preferred display currency for converted shipment values.
+  /// Validated against SUPPORTED_CURRENCIES in FxRateService.
+  /// Defaults to 'USD' so existing users see no behaviour change.
+  displayCurrency  String    @default("USD")
+
   createdAt        DateTime  @default(now())
   updatedAt        DateTime  @updatedAt
 
@@ -402,6 +407,33 @@ model EventCursor {
   updatedAt           DateTime @updatedAt
 
   @@map("event_cursors")
+}
+
+enum BackfillStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+/// Tracks a single admin-initiated ledger-range event backfill.
+/// Only one row may be in PENDING or RUNNING state at a time.
+model BackfillRun {
+  id             String        @id @default(uuid())
+  status         BackfillStatus @default(PENDING)
+  fromLedger     Int
+  toLedger       Int
+  processedCount Int           @default(0)  // events successfully processed
+  errorCount     Int           @default(0)  // events that failed handler execution
+  currentLedger  Int?                       // last ledger polled (progress indicator)
+  errorSummary   Json?                      // array of { ledger, txHash, eventName, error }
+  startedAt      DateTime      @default(now())
+  completedAt    DateTime?
+  initiatedBy    String?                    // Stellar address of the admin who triggered it
+
+  @@index([status])
+  @@index([startedAt])
+  @@map("backfill_runs")
 }
 
 model FailedEvent {

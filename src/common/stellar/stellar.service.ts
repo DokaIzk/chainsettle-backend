@@ -239,6 +239,60 @@ onModuleInit() {
   }
 
   /**
+   * Probes the Soroban RPC retention window by binary-searching for the oldest
+   * ledger that `getEvents` can still serve.
+   *
+   * Strategy: the Stellar RPC rejects `getEvents` calls whose `startLedger`
+   * is older than the node's history window with an error containing the phrase
+   * "startLedger". We binary-search between 1 and (latestLedger - 1) to find
+   * the actual retention floor.  A simpler heuristic is used as the lower bound
+   * so the search converges quickly (~7 iterations for a 17-day / ~1.5 M ledger
+   * window at 5 s/ledger).
+   *
+   * Returns the lowest ledger number the RPC can still serve, or 1 on failure.
+   */
+  async getOldestAvailableLedger(): Promise<number> {
+    let latest: number;
+    try {
+      latest = await this.getLatestLedger();
+    } catch {
+      return 1;
+    }
+
+    // A Soroban RPC node typically retains ~17 days ≈ ~288 000 ledgers.
+    // Start the binary search a little beyond that as the lower bound.
+    let lo = Math.max(1, latest - 400_000);
+    let hi = latest - 1;
+    let oldest = latest;
+
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      try {
+        await this.rpcClient.getEvents({
+          startLedger: mid,
+          filters: [],
+          limit: 1,
+        });
+        // RPC accepted this ledger → try going even further back
+        oldest = mid;
+        hi = mid - 1;
+      } catch (err) {
+        const msg: string = (err as Error).message ?? '';
+        if (msg.toLowerCase().includes('startledger') || msg.toLowerCase().includes('not found')) {
+          // Too old — move the lower bound up
+          lo = mid + 1;
+        } else {
+          // Unexpected RPC error — bail out conservatively
+          this.logger.warn(`getOldestAvailableLedger probe error at ${mid}: ${msg}`);
+          break;
+        }
+      }
+    }
+
+    return oldest;
+  }
+
+  /**
    * Fetches metadata for a specific ledger sequence number via the Stellar RPC.
    * Returns { sequence, closedAt, txCount, baseFee } or null if not found.
    */

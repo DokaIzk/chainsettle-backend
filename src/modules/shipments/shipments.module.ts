@@ -12,9 +12,10 @@ import { CommentsService } from './comments.service';
 import { AuditLogsModule } from '../audit-logs/audit-logs.module';
 import { NotificationsModule } from '../notifications/notifications.module';
 import { RedisModule } from '../../common/redis/redis.module';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports: [NotificationsModule, RedisModule, AuditLogsModule],
+  imports: [NotificationsModule, RedisModule, AuditLogsModule, AuthModule],
   controllers: [ShipmentsController, AdminShipmentsController, CommentsController],
   providers: [ShipmentsService, ShipmentApprovalsService, SavedFiltersService, CommentsService, ShipmentArchivalJob, ShipmentRemindersService, ShipmentReminderJob],
   exports: [ShipmentsService, ShipmentApprovalsService, SavedFiltersService],
