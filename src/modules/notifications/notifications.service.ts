@@ -584,7 +584,12 @@ export class NotificationsService {
     type?: NotificationType,
     data?: Record<string, any>,
     locale: string = DEFAULT_LOCALE,
-  ) {
+  ): Promise<boolean> {
+    // Never send to addresses that hard-bounced or complained (#434).
+    if (await this.isEmailSuppressed(to)) {
+      this.logger.warn(`Email to ${to} skipped — address is on the suppression list`);
+      return false;
+    }
     try {
       let renderedHtml = html;
       if (!renderedHtml && type) {
@@ -612,8 +617,25 @@ export class NotificationsService {
         `,
       });
       this.logger.log(`Email sent to ${to}: ${localizedSubject}`);
+      return true;
     } catch (error) {
       this.logger.error(`Email failed to ${to}`, error.message);
+      return false;
+    }
+  }
+
+  /** True when the address is on the bounce/complaint suppression list (#434). */
+  async isEmailSuppressed(email: string): Promise<boolean> {
+    try {
+      const hit = await this.prisma.emailSuppression.findUnique({
+        where: { email: email.trim().toLowerCase() },
+        select: { id: true },
+      });
+      return !!hit;
+    } catch (error) {
+      // Fail closed: if we can't check the list, don't risk hurting sender reputation.
+      this.logger.error(`Suppression lookup failed for ${email}`, error.message);
+      return true;
     }
   }
 

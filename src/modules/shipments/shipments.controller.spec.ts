@@ -1,6 +1,7 @@
 // NOTE: This repository's CI/test runner appears misconfigured in the current environment.
 // Tests added for RBAC logic are primarily meant for Jest unit testing in a properly set up CI.
 
+import { OrganizationsService } from '../organizations/organizations.service';
 import { ForbiddenException } from '@nestjs/common';
 import { ShipmentsController } from './shipments.controller';
 import { ShipmentsService } from './shipments.service';
@@ -34,6 +35,7 @@ describe('ShipmentsController (RBAC)', () => {
             mockApprovals as ShipmentApprovalsService,
             mockSavedFilters as SavedFiltersService,
             mockRedis as RedisService,
+            {} as OrganizationsService,
         );
 
         const dto: any = {
@@ -62,6 +64,7 @@ describe('ShipmentsController (RBAC)', () => {
             mockApprovals as ShipmentApprovalsService,
             mockSavedFilters as SavedFiltersService,
             mockRedis as RedisService,
+            {} as OrganizationsService,
         );
 
         const dto: any = {
@@ -95,6 +98,7 @@ describe('ShipmentsController (RBAC)', () => {
             mockApprovals as ShipmentApprovalsService,
             mockSavedFilters as SavedFiltersService,
             redisMock as RedisService,
+            {} as OrganizationsService,
         );
 
         const dto: any = {

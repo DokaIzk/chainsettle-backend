@@ -46,6 +46,8 @@ import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ValidateMetadataDto } from './dto/metadata.dto';
 import { ShipmentParticipantGuard } from './guards/shipment-participant.guard';
+import { ShipmentReadAccessGuard } from './guards/shipment-read-access.guard';
+import { OrganizationsService } from '../organizations/organizations.service';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole } from '@prisma/client';
 import { parseFields, SHIPMENT_LIST_FIELDS, SHIPMENT_DETAIL_FIELDS } from './shipment-fields';
@@ -158,6 +160,11 @@ export class ShipmentsController {
     }
 
     const isAdmin = user?.role === UserRole.ADMIN;
+    // Org view (#435): membership is checked on every request, so removed
+    // members lose access immediately.
+    const participantAddresses = query.organizationId
+      ? await this.organizations.getMemberAddresses(query.organizationId, user.id)
+      : undefined;
     const tags = query.tags ? query.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
 
     const fields = parseFields(query.fields, SHIPMENT_LIST_FIELDS);
@@ -400,7 +407,7 @@ export class ShipmentsController {
    * Full shipment detail including milestones and recent on-chain events.
    */
   @Get(':id')
-  @UseGuards(ShipmentParticipantGuard)
+  @UseGuards(ShipmentReadAccessGuard)
   @ApiOperation({ summary: 'Get full shipment details including milestones and events' })
   @ApiResponse({ status: 200, description: 'Shipment found' })
   @ApiResponse({ status: 404, description: 'Shipment not found' })
@@ -416,6 +423,19 @@ export class ShipmentsController {
     const precisionOverride = precision !== undefined ? parseInt(precision, 10) : undefined;
     const fields = parseFields(fieldsRaw, SHIPMENT_DETAIL_FIELDS);
     return this.shipmentsService.findOne(id, user?.id, precisionOverride, fields);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/history/:auditId/diff
+   * Field-level `[{ field, before, after }]` for one audit entry (#436).
+   */
+  @Get(':id/history/:auditId/diff')
+  @UseGuards(ShipmentReadAccessGuard)
+  @ApiOperation({ summary: 'Field-level before/after diff for a shipment audit entry' })
+  @ApiResponse({ status: 200, description: 'List of changed fields (empty for legacy entries)' })
+  @ApiResponse({ status: 404, description: 'Audit entry not found for this shipment' })
+  getHistoryDiff(@Param('id') id: string, @Param('auditId') auditId: string, @CurrentUser() user: any) {
+    return this.shipmentsService.getHistoryDiff(id, auditId, user?.role === UserRole.ADMIN);
   }
 
   /**

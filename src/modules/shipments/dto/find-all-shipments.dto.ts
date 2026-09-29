@@ -14,6 +14,13 @@ export class FindAllShipmentsDto {
   @IsString()
   supplierAddress?: string;
 
+  @ApiPropertyOptional({
+    description: "Show shipments where any member of this organization is a participant (#435). Caller must be a member.",
+  })
+  @IsOptional()
+  @IsString()
+  organizationId?: string;
+
   @ApiPropertyOptional({ description: 'Filter by shipment status', enum: ShipmentStatus })
   @IsOptional()
   @IsString()

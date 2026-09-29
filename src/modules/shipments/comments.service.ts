@@ -5,11 +5,13 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  Optional,
 } from '@nestjs/common';
 import { CommentVisibility, NotificationType } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { NotificationsService } from '../notifications/notifications.service';
 import { CreateCommentDto } from './dto/create-comment.dto';
+import { OrganizationsService } from '../organizations/organizations.service';
 
 /** Maximum number of pinned comments allowed per shipment */
 const MAX_PINNED_COMMENTS = 3;
@@ -27,6 +29,7 @@ export class CommentsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly notifications: NotificationsService,
+    @Optional() private readonly organizations?: OrganizationsService,
   ) {}
 
   // ----------------------------------------------------------
@@ -44,7 +47,11 @@ export class CommentsService {
     });
     if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
 
-    if (!this.isParticipant(authorAddress, shipment)) {
+    // Org members (#435) may comment unless their org role is VIEWER.
+    if (
+      !this.isParticipant(authorAddress, shipment) &&
+      !(await this.organizations?.canCommentOnShipment(authorId, shipment))
+    ) {
       throw new ForbiddenException('Only shipment participants can post comments');
     }
 
@@ -293,7 +300,11 @@ export class CommentsService {
     });
     const isAdmin = requester?.role === 'ADMIN';
 
-    if (!isAdmin && !this.isParticipant(requesterAddress, shipment)) {
+    if (
+      !isAdmin &&
+      !this.isParticipant(requesterAddress, shipment) &&
+      !(requester && (await this.organizations?.canReadShipment(requester.id, shipment)))
+    ) {
       throw new ForbiddenException('Only shipment participants can read comments');
     }
 

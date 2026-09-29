@@ -51,6 +51,8 @@ export function ifMatchSatisfied(ifMatch: string, currentEtag: string): boolean 
     .some((v) => v === '*' || v === currentEtag);
 }
 
+import { computeFieldChanges, extractChanges, isHiddenField } from './shipment-diff.util';
+
 @Injectable()
 export class ShipmentsService {
   private readonly logger = new Logger(ShipmentsService.name);
@@ -335,7 +337,17 @@ export class ShipmentsService {
     }
 
     // Scope to shipments where the caller is a participant (buyer/supplier/logistics/arbiter)
-    if (!isAdmin && callerStellarAddress) {
+    if (participantAddresses) {
+      where.AND = where.AND ?? [];
+      where.AND.push({
+        OR: [
+          { buyerAddress: { in: participantAddresses } },
+          { supplierAddress: { in: participantAddresses } },
+          { logisticsAddress: { in: participantAddresses } },
+          { arbiterAddress: { in: participantAddresses } },
+        ],
+      });
+    } else if (!isAdmin && callerStellarAddress) {
       where.AND = where.AND ?? [];
       where.AND.push({
         OR: [
@@ -363,12 +375,15 @@ export class ShipmentsService {
     let nextCursor: string | null = null;
 
     if (search) {
-      const participantCondition =
-        !isAdmin && callerStellarAddress
-          ? `AND (buyer_address = $1 OR supplier_address = $1 OR logistics_address = $1 OR arbiter_address = $1)`
-          : '';
-      const participantParams =
-        !isAdmin && callerStellarAddress ? [callerStellarAddress] : [];
+      const scopeAddresses = participantAddresses
+        ? participantAddresses
+        : !isAdmin && callerStellarAddress
+          ? [callerStellarAddress]
+          : null;
+      const participantCondition = scopeAddresses
+        ? `AND (buyer_address = ANY($1::text[]) OR supplier_address = ANY($1::text[]) OR logistics_address = ANY($1::text[]) OR arbiter_address = ANY($1::text[]))`
+        : '';
+      const participantParams = scopeAddresses ? [scopeAddresses] : [];
 
       const query = `
         SELECT * FROM shipments
@@ -759,9 +774,48 @@ export class ShipmentsService {
       },
     });
 
+    // Record before/after snapshots of the changed fields only (#436).
+    const changes = computeFieldChanges(
+      shipment as unknown as Record<string, unknown>,
+      updateData,
+      Object.keys(updateData),
+    );
+    if (changes.length > 0) {
+      await this.auditLog.record({
+        actorId: callerId,
+        actorAddress: buyerAddress,
+        action: 'SHIPMENT_UPDATED',
+        resourceType: 'Shipment',
+        resourceId: id,
+        metadata: { changes },
+      });
+    }
+
     this.logger.log(`Shipment updated: ${id}`);
     await this.invalidateUserCache(buyerAddress);
     return await this.serialize(updated);
+  }
+
+  /**
+   * GET /shipments/:id/history/:auditId/diff (#436)
+   * Field-level before/after values for one audit entry. Entries recorded
+   * before snapshots existed return an empty diff.
+   */
+  async getHistoryDiff(shipmentId: string, auditId: string, isAdmin = false) {
+    const entry = await this.prisma.auditLog.findFirst({
+      where: {
+        id: auditId,
+        OR: [
+          { resourceType: 'Shipment', resourceId: shipmentId },
+          { entityType: 'Shipment', entityId: shipmentId },
+        ],
+      },
+    });
+    if (!entry) {
+      throw new NotFoundException(`Audit entry ${auditId} not found for shipment ${shipmentId}`);
+    }
+    const changes = extractChanges(entry.metadata);
+    return isAdmin ? changes : changes.filter((c) => !isHiddenField(c.field));
   }
 
   async replaceTags(
@@ -825,6 +879,7 @@ export class ShipmentsService {
       metadata: {
         previousTags: shipment.tags,
         nextTags,
+        changes: computeFieldChanges({ tags: shipment.tags }, { tags: nextTags }, ['tags']),
       },
     });
 
