@@ -36,6 +36,7 @@ export class ShipmentEventsPublisher {
           releasedAmount: shipment.releasedAmount?.toString() ?? '0',
           description: shipment.description ?? undefined,
           referenceNumber: shipment.referenceNumber ?? undefined,
+          expectedDeliveryAt: shipment.expectedDeliveryAt ?? undefined,
           createdAt: shipment.createdAt,
           milestones: [],
           recentEvents: [],

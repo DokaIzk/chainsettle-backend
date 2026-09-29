@@ -42,6 +42,7 @@ import { CreateTrackingDto } from './dto/tracking.dto';
 import { FindAllShipmentsDto } from './dto/find-all-shipments.dto';
 import { AddTagDto } from './dto/tag.dto';
 import { NoteDto } from './dto/note.dto';
+import { FindShipmentDocumentsDto } from './dto/shipment-document.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ValidateMetadataDto } from './dto/metadata.dto';
@@ -409,6 +410,28 @@ export class ShipmentsController {
   @ApiResponse({ status: 403, description: 'Not a participant' })
   getParticipants(@Param('id') id: string) {
     return this.shipmentsService.getParticipants(id);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/documents
+   * Return every IPFS document linked to a shipment (proofs, dispute evidence, comment attachments).
+   * Restricted to shipment participants. Respects comment visibility rules.
+   */
+  @Get(':id/documents')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get all IPFS documents attached to a shipment' })
+  @ApiQuery({ name: 'source', required: false, enum: ['PROOF', 'DISPUTE_EVIDENCE', 'COMMENT'], description: 'Filter by document source' })
+  @ApiResponse({ status: 200, description: 'List of documents attached to the shipment' })
+  @ApiResponse({ status: 403, description: 'Not a shipment participant' })
+  @ApiResponse({ status: 404, description: 'Shipment not found' })
+  getDocuments(
+    @Param('id') id: string,
+    @Query() query: FindShipmentDocumentsDto,
+    @CurrentUser() user: any,
+  ) {
+    const callerAddress = user?.stellarAddress ?? user?.sub;
+    const isAdmin = user?.role === UserRole.ADMIN;
+    return this.shipmentsService.getDocuments(id, callerAddress, isAdmin, query?.source);
   }
 
   /**

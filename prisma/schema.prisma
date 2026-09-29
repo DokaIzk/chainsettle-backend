@@ -55,6 +55,7 @@ enum NotificationType {
   PROOF_REJECTED
   DEADLINE_EXTENSION_REQUESTED
   DEADLINE_EXTENSION_DECIDED
+  DELIVERY_DELAYED
 }
 
 enum CommentVisibility {
@@ -211,6 +212,7 @@ model Shipment {
   referenceNumber  String?         @unique // contract/PO reference for external systems
   metadata         Json?           // arbitrary key-value pairs (incoterms, port, etc)
   tags             String[]        @default([]) // searchable tags
+  expectedDeliveryAt DateTime?     // promised delivery date/time
 
   // Cancellation / refund tracking
   cancelledAt      DateTime?       // set when shipment is cancelled on-chain
