@@ -1,4 +1,4 @@
-import { Injectable, Logger, Optional } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as nodemailer from 'nodemailer';
 import * as fs from 'fs';
@@ -20,6 +20,7 @@ type PreferenceMap = Record<NotificationType, ChannelPrefs>;
 export type DigestFrequency = 'instant' | 'daily' | 'weekly';
 type StoredPreferences = PreferenceMap & {
   _meta?: { digestFrequency?: DigestFrequency };
+  _quietHours?: { enabled: boolean; start: string; end: string; timezone: string };
 };
 
 type NotificationGroup = {
@@ -123,15 +124,17 @@ export class NotificationsService {
       const { preferences: prefs, slackWebhookUrl, discordWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
       const { inApp, email: emailEnabled, slack: slackEnabled, sms: smsEnabled, discord: discordEnabled } = normalizeChannelPrefs(prefs[type]);
       const { preferences: prefs, slackWebhookUrl } = await this.getOrCreatePreferenceRecord(user.id);
+      const quietHours = (prefs as StoredPreferences)._quietHours;
+      const deliverAfter = type === NotificationType.SYSTEM_ALERT && data?.urgent === true ? null : this.getQuietHoursEnd(new Date(), quietHours);
       const { inApp, email: emailEnabled, slack: slackEnabled, push: pushEnabled } = normalizeChannelPrefs(prefs[type]);
 
       if (!inApp) return;
 
       const notification = await this.prisma.notification.create({
-        data: { userId: user.id, type, title, message, data: data ?? {} },
+        data: { userId: user.id, type, title, message, data: data ?? {}, ...(deliverAfter ? { deliverAfter } : {}) },
       });
 
-      if (emailEnabled && user.email) {
+      if (!deliverAfter && emailEnabled && user.email) {
         await this.sendEmail(user.email, title, message, undefined, type, data);
         await this.prisma.notification.update({
           where: { id: notification.id },
@@ -139,7 +142,7 @@ export class NotificationsService {
         });
       }
 
-      if (slackEnabled && slackWebhookUrl) {
+      if (!deliverAfter && slackEnabled && slackWebhookUrl) {
         await this.sendSlackMessage(slackWebhookUrl, type, title, message, data);
       }
 
@@ -155,7 +158,7 @@ export class NotificationsService {
 
       this.gateway?.pushToUser(user.id, notification);
 
-      if (pushEnabled) {
+      if (!deliverAfter && pushEnabled) {
         this.webPush
           ?.sendToUser(user.id, type, title, message, data as Record<string, string> | undefined)
           .catch((err) => this.logger.error('Web push dispatch error', err.message));
@@ -190,16 +193,17 @@ export class NotificationsService {
       }
 
       const prefs = await this.getOrCreatePreferences(user.id);
+      const deliverAfter = type === NotificationType.SYSTEM_ALERT && data?.urgent === true ? null : this.getQuietHoursEnd(new Date(), (prefs as StoredPreferences)._quietHours);
       const { inApp } = prefs[type] ?? prefs[NotificationType.COMMENT_ADDED];
 
       if (!inApp) return;
 
       const notification = await this.prisma.notification.create({
-        data: { userId: user.id, type, title, message, data: data ?? {} },
+        data: { userId: user.id, type, title, message, data: { ...(data ?? {}), ...(deliverAfter ? { forceEmail: true } : {}) }, ...(deliverAfter ? { deliverAfter } : {}) },
       });
 
       // Force email delivery regardless of digest preference when the user has an email
-      if (user.email) {
+      if (user.email && !deliverAfter) {
         await this.sendEmail(user.email, title, message, undefined, type, data);
         await this.prisma.notification.update({
           where: { id: notification.id },
@@ -311,9 +315,20 @@ export class NotificationsService {
     };
   }
 
+  private validateQuietHours(q: any): void {
+    if (!q || typeof q.enabled !== 'boolean' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(q.start) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(q.end) || typeof q.timezone !== 'string') throw new BadRequestException('quietHours must contain enabled, HH:mm start/end, and an IANA timezone');
+    try { new Intl.DateTimeFormat('en-US', { timeZone: q.timezone }); } catch { throw new BadRequestException('quietHours.timezone must be a valid IANA timezone'); }
+  }
+
+  async isQuietHours(userId: string): Promise<boolean> {
+    const prefs = await this.getOrCreatePreferences(userId) as StoredPreferences;
+    return this.getQuietHoursEnd(new Date(), prefs._quietHours) !== null;
+  }
   async updatePreferences(userId: string, dto: UpdatePreferencesDto) {
+    if (dto.quietHours !== undefined) this.validateQuietHours(dto.quietHours);
     const current = (await this.getOrCreatePreferences(userId)) as StoredPreferences;
     const merged: StoredPreferences = { ...current, ...(dto.preferences ?? {}) };
+    if (dto.quietHours !== undefined) merged._quietHours = dto.quietHours;
     if (dto.digestFrequency) {
       merged._meta = { ...current._meta, digestFrequency: dto.digestFrequency };
     }
@@ -353,10 +368,11 @@ export class NotificationsService {
   async getPreferencesResponse(userId: string) {
     const { preferences, slackWebhookUrl, discordWebhookUrl } = await this.getOrCreatePreferenceRecord(userId);
     const stored = preferences as StoredPreferences;
-    const { _meta, ...typePreferences } = stored;
+    const { _meta, _quietHours, ...typePreferences } = stored;
     return {
       ...typePreferences,
       digestFrequency: _meta?.digestFrequency ?? DEFAULT_DIGEST_FREQUENCY,
+      quietHours: _quietHours ?? { enabled: false, start: '22:00', end: '08:00', timezone: 'UTC' },
       slackWebhookUrl,
       discordWebhookUrl,
     };
@@ -615,11 +631,14 @@ export class NotificationsService {
         data?.milestoneIndex !== undefined ? String(data.milestoneIndex) : undefined;
 
       const fields = [
-        shipmentId ? { type: 'mrkdwn', text: `*Shipment:*\n\`${shipmentId}\`` } : null,
+        shipmentId ? { type: 'mrkdwn', text: `*Shipment:*
+\`${shipmentId}\`` } : null,
         milestoneIndex !== undefined
-          ? { type: 'mrkdwn', text: `*Milestone:*\n${milestoneIndex}` }
+          ? { type: 'mrkdwn', text: `*Milestone:*
+${milestoneIndex}` }
           : null,
-        { type: 'mrkdwn', text: `*Type:*\n${type}` },
+        { type: 'mrkdwn', text: `*Type:*
+${type}` },
       ].filter(Boolean);
 
       const payload = {

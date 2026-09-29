@@ -103,7 +103,9 @@ export class ShipmentsService {
     const tokenAddress = dto.tokenAddress ?? templateData.tokenAddress;
     const milestones = dto.milestones ?? templateData.milestones;
 
-    // Validate required fields
+    if (arbiterAddress && [dto.buyerAddress, supplierAddress, logisticsAddress].some(a => a && a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+
+        // Validate required fields
     if (!supplierAddress || !logisticsAddress || !arbiterAddress || !tokenAddress || !milestones) {
       throw new ConflictException(
         'Missing required fields: supplierAddress, logisticsAddress, arbiterAddress, tokenAddress, milestones',
@@ -201,7 +203,7 @@ export class ShipmentsService {
     this.metrics.incrementShipmentsCreated();
     this.metrics.incrementActiveShipments();
     await this.invalidateUserCache(dto.buyerAddress);
-    return await this.serialize(shipment);
+    return { ...(await this.serialize(shipment)), warnings: await this.getArbiterWarnings(arbiterAddress, dto.buyerAddress, supplierAddress) };
   }
 
   // ----------------------------------------------------------
@@ -924,6 +926,33 @@ export class ShipmentsService {
   }
 
   // ----------------------------------------------------------
+  private async getArbiterWarnings(arbiterAddress: string, buyerAddress: string, supplierAddress: string): Promise<string[]> {
+    const since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+    const relatedTrade = await this.prisma.shipment.findFirst({ where: { createdAt: { gte: since }, OR: [
+      { buyerAddress: arbiterAddress, supplierAddress: { in: [buyerAddress, supplierAddress] } },
+      { supplierAddress: arbiterAddress, buyerAddress: { in: [buyerAddress, supplierAddress] } },
+    ] }, select: { id: true } });
+    const [total, sameBuyer] = await Promise.all([
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress } } }),
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress, buyerAddress } } }),
+    ]);
+    const threshold = Math.min(1, Math.max(0, Number(process.env.ARBITER_REPEAT_BUYER_WARNING_THRESHOLD ?? 0.5)));
+    const warnings: string[] = [];
+    if (relatedTrade) warnings.push('Arbiter has traded with a shipment party in the last 12 months.');
+    if (total > 0 && sameBuyer / total > threshold) warnings.push(`More than ${Math.round(threshold * 100)}% of this arbiter's past resolutions involved this buyer.`);
+    return warnings;
+  }
+
+  async replaceArbiter(id: string, buyerAddress: string, arbiterAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) throw new ForbiddenException('Only the buyer may replace the arbiter');
+    if (shipment.arbiterStatus === ArbiterStatus.ACCEPTED) throw new ConflictException('An accepted arbiter cannot be replaced');
+    if ([shipment.buyerAddress, shipment.supplierAddress, shipment.logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+    const updated = await this.prisma.shipment.update({ where: { id }, data: { arbiterAddress, arbiterStatus: ArbiterStatus.PENDING_ACCEPTANCE } });
+    await this.notifications.notifyUser(arbiterAddress, NotificationType.ARBITER_INVITED, 'Arbiter assignment invitation', `You have been assigned as arbiter for shipment ${id}.`, { shipmentId: id, buyerAddress, supplierAddress: shipment.supplierAddress });
+    return { ...(await this.serialize(updated)), warnings: await this.getArbiterWarnings(arbiterAddress, buyerAddress, shipment.supplierAddress) };
+  }
   // ARBITER ACCEPT / DECLINE
   // ----------------------------------------------------------
 
@@ -1995,6 +2024,8 @@ export class ShipmentsService {
         const totalAmount = (r.totalAmount ?? r.totalamount ?? '').trim();
         const description = (r.description ?? '').trim();
         const referenceNumber = (r.referenceNumber ?? r.referencenumber ?? '').trim();
+
+        if (arbiterAddress && [buyerAddress, supplierAddress, logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
 
         // Validate required fields
         if (!supplierAddress) throw new Error('supplierAddress is required');

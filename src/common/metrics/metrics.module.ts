@@ -1,6 +1,6 @@
 import { Global, Logger, Module } from '@nestjs/common';
 import { PrometheusModule } from '@willsoto/nestjs-prometheus';
-import { makeCounterProvider, makeGaugeProvider } from '@willsoto/nestjs-prometheus';
+import { makeCounterProvider, makeGaugeProvider, makeHistogramProvider } from '@willsoto/nestjs-prometheus';
 import { ShipmentStatus } from '@prisma/client';
 import { Gauge } from 'prom-client';
 import { PrismaService } from '../prisma/prisma.service';
@@ -11,6 +11,8 @@ import {
   SHIPMENTS_CREATED_COUNTER,
   ACTIVE_SHIPMENTS_GAUGE,
   SHIPMENTS_BY_STATUS_GAUGE,
+  OPEN_DISPUTES_GAUGE,
+  DISPUTE_RESOLUTION_TIME_HISTOGRAM,
 } from './metrics.service';
 
 const logger = new Logger('MetricsModule');
@@ -34,6 +36,11 @@ export async function collectShipmentsByStatus(this: Gauge<string>, prisma: Pris
   } catch (err) {
     logger.warn(`Failed to refresh ${SHIPMENTS_BY_STATUS_GAUGE}: ${err.message}`);
   }
+}
+
+export async function collectOpenDisputes(this: Gauge<string>, prisma: PrismaService) {
+  try { this.set(await prisma.milestone.count({ where: { status: 'DISPUTED', deletedAt: null } })); }
+  catch (err) { logger.warn('Failed to refresh open dispute gauge'); }
 }
 
 @Global()
@@ -62,6 +69,13 @@ export async function collectShipmentsByStatus(this: Gauge<string>, prisma: Pris
       name: ACTIVE_SHIPMENTS_GAUGE,
       help: 'Current number of active shipments',
     }),
+    makeGaugeProvider({
+      name: OPEN_DISPUTES_GAUGE,
+      help: 'Current number of open disputes',
+      inject: [PrismaService],
+      collect: collectOpenDisputes,
+    }),
+    makeHistogramProvider({ name: DISPUTE_RESOLUTION_TIME_HISTOGRAM, help: 'Time taken to resolve disputes in hours', buckets: [1, 6, 12, 24, 48, 72, 168, 336] }),
     makeGaugeProvider({
       name: SHIPMENTS_BY_STATUS_GAUGE,
       help: 'Current number of shipments in each status',

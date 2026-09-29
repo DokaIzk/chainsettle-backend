@@ -6,6 +6,10 @@ import { DigestFrequency } from '../notifications.service';
 const DIGEST_FREQUENCIES: DigestFrequency[] = ['instant', 'daily', 'weekly'];
 
 export class UpdatePreferencesDto {
+  @ApiProperty({ required: false, example: { enabled: true, start: '22:00', end: '08:00', timezone: 'Africa/Lagos' } })
+  @IsOptional()
+  @IsObject()
+  quietHours?: { enabled: boolean; start: string; end: string; timezone: string };
   @ApiProperty({
     description: 'Partial map of NotificationType to channel flags',
     example: { PROOF_SUBMITTED: { inApp: true, email: false, slack: true, sms: false, discord: true } },
