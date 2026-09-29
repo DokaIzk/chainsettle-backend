@@ -1,6 +1,24 @@
 import { ObjectType, Field, ID, Int, Float } from '@nestjs/graphql';
 
 @ObjectType()
+export class ProofSubmissionGql {
+  @Field(() => ID)
+  id: string;
+
+  @Field()
+  milestoneId: string;
+
+  @Field()
+  ipfsCid: string;
+
+  @Field()
+  submittedBy: string;
+
+  @Field()
+  createdAt: Date;
+}
+
+@ObjectType()
 export class MilestoneGql {
   @Field(() => ID)
   id: string;
@@ -28,6 +46,15 @@ export class MilestoneGql {
 
   @Field({ nullable: true })
   dueAt?: Date;
+
+  @Field({ nullable: true, description: 'Exact amount released for this milestone, as a string (stroops)' })
+  paymentReleased?: string;
+
+  @Field({ nullable: true })
+  createdAt?: Date;
+
+  @Field(() => [ProofSubmissionGql], { description: 'Proof upload history, oldest first' })
+  proofSubmissions?: ProofSubmissionGql[];
 }
 
 @ObjectType()
