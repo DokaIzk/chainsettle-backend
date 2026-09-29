@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit, OnModuleDestroy, Optional } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
@@ -7,7 +7,7 @@ import { RedisService } from '../../common/redis/redis.service';
 import { StellarService } from '../../common/stellar/stellar.service';
 import { MilestonesService } from '../milestones/milestones.service';
 import { NotificationsService } from '../notifications/notifications.service';
-import { NotificationsGateway } from '../notifications/notifications.gateway';
+import { ShipmentEventsPublisher } from '../graphql/shipment-events.publisher';
 import { ShipmentsService } from '../shipments/shipments.service';
 import { MetricsService } from '../../common/metrics/metrics.service';
 import { NotificationType } from '@prisma/client';
@@ -55,6 +55,7 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     private readonly shipments: ShipmentsService,
     private readonly config: ConfigService,
     private readonly metrics: MetricsService,
+    @Optional() private readonly gqlPublisher?: ShipmentEventsPublisher,
   ) {}
 
   async onModuleInit() {
@@ -270,11 +271,18 @@ export class EventsService implements OnModuleInit, OnModuleDestroy {
     await this.saveRawEvent(eventName, event, payload);
     await this.executeHandler(eventName, payload, event);
     this.metrics.incrementEventsProcessed(eventName);
+    await this.publishGraphqlUpdate(payload);
+  }
 
-    const shipmentId = this.extractShipmentId(payload);
-    if (shipmentId) {
-      this.gateway.pushToShipmentRoom(shipmentId, eventName, payload);
-    }
+  /** Fan the processed chain event out to GraphQL subscribers (#431). */
+  private async publishGraphqlUpdate(payload: any) {
+    if (!this.gqlPublisher) return;
+    const [shipmentId, milestoneIndex] = Array.isArray(payload) ? payload : [payload, undefined];
+    if (shipmentId === undefined || shipmentId === null) return;
+    await this.gqlPublisher.publishShipment(
+      String(shipmentId),
+      milestoneIndex === undefined ? undefined : Number(milestoneIndex),
+    );
   }
 
   private async executeHandler(eventName: string, payload: any, meta: any) {

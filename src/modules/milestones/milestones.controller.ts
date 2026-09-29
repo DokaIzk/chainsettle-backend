@@ -157,7 +157,7 @@ export class MilestonesController {
     @Param('shipmentId') shipmentId: string,
     @Param('index', ParseIntPipe) index: number,
   ) {
-    return this.milestonesService.findOne(shipmentId, index);
+    return this.milestonesService.findOneWithCommentCount(shipmentId, index);
   }
 
   @Get(':index/reminders')
@@ -269,6 +269,43 @@ export class MilestonesController {
       callerAddress,
       file,
     );
+  }
+
+  /**
+   * POST /api/v1/shipments/:shipmentId/milestones/:index/proof/verify
+   *
+   * Hashes the uploaded file with SHA-256 and reports whether it matches a
+   * stored proof submission for this milestone (#394).
+   */
+  @Post(':index/proof/verify')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Check whether a file matches a stored milestone proof (SHA-256)' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['file'],
+      properties: { file: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 200, description: '{ matches, submissionId?, sha256 }' })
+  @ApiResponse({ status: 400, description: 'No file uploaded' })
+  @ApiResponse({ status: 404, description: 'Milestone not found' })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_SIZE },
+    }),
+  )
+  verifyProof(
+    @Param('shipmentId') shipmentId: string,
+    @Param('index', ParseIntPipe) index: number,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) {
+      throw new BadRequestException('A file must be provided in the "file" field');
+    }
+    return this.milestonesService.verifyProof(shipmentId, index, file);
   }
 
   /**

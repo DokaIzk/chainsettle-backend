@@ -16,6 +16,7 @@ import { StellarService } from '../../common/stellar/stellar.service';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 import * as nodemailer from 'nodemailer';
+import { resolveBuildInfo } from '../../common/build-info';
 
 @ApiTags('health')
 @Controller('health')
@@ -73,6 +74,18 @@ export class HealthController {
       () => this.prismaHealth.pingCheck('database', this.prisma),
       () => this.ipfsHealthCheck(),
     ]);
+  }
+
+  /**
+   * GET /health/version
+   * Build and version info for the running instance — used to confirm which
+   * release each blue/green slot is serving (#427). Values are `unknown` when
+   * not injected at Docker build time.
+   */
+  @Get('version')
+  @ApiOperation({ summary: 'Running build version, git commit, build time, Node version and uptime' })
+  version() {
+    return { ...resolveBuildInfo(), uptimeSeconds: Math.floor(process.uptime()) };
   }
 
   private ipfsHealthCheck(): HealthIndicatorResult {
