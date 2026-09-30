@@ -200,6 +200,7 @@ export class ShipmentsController {
       callerUserId: user?.id,
       fields,
       displayCurrency,
+      riskLevel: query.riskLevel,
     });
   }
 
@@ -492,6 +493,29 @@ export class ShipmentsController {
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename="chainsettle-shipment-${id}-${timestamp}.pdf"`);
     res.end(pdf);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/risk
+   * Evaluates computed risk indicators and derives overall risk level (LOW, MEDIUM, HIGH) with reasons.
+   */
+  @Get(':id/risk')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({
+    summary: 'Get computed risk indicators and risk level for a shipment',
+    description:
+      'Evaluates risk indicators for the shipment: overdue milestones, open disputes, arbiter status, ' +
+      'days since last activity, and unverified counterparties. ' +
+      'Derives an overall risk level (LOW, MEDIUM, HIGH) based on configurable thresholds:\n' +
+      '- HIGH: >= 1 open disputes, >= 2 overdue milestones, >= 30 days inactive, or (>= 1 overdue milestone and arbiter not accepted).\n' +
+      '- MEDIUM: 1 overdue milestone, arbiter not accepted, >= 14 days inactive, or >= 1 unverified counterparties.\n' +
+      '- LOW: All indicators within normal parameters.',
+  })
+  @ApiResponse({ status: 200, description: 'Shipment risk indicators and derived risk level' })
+  @ApiResponse({ status: 403, description: 'Forbidden: Not a shipment participant' })
+  @ApiResponse({ status: 404, description: 'Shipment not found' })
+  getRisk(@Param('id') id: string) {
+    return this.shipmentsService.getShipmentRisk(id);
   }
 
   /**

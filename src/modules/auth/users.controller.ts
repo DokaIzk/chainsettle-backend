@@ -1,10 +1,38 @@
-import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req, Param } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam } from '@nestjs/swagger';
+import {
+  Controller,
+  Get,
+  Patch,
+  Post,
+  Put,
+  Delete,
+  Body,
+  Query,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+  Req,
+  Param,
+  UseInterceptors,
+  UploadedFile,
+  BadRequestException,
+} from '@nestjs/common';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+  ApiParam,
+  ApiConsumes,
+  ApiBody,
+} from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { memoryStorage } from 'multer';
 import { AuthService } from './auth.service';
 import { SessionService } from './session.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { RevokeAllSessionsDto } from './dto/revoke-all-sessions.dto';
 import { SetPhoneDto, VerifyPhoneDto } from './dto/verify-phone.dto';
+import { LoginHistoryQueryDto } from './dto/login-history-query.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { BlockImpersonation } from '../../common/decorators/block-impersonation.decorator';
@@ -94,6 +122,27 @@ export class UsersController {
   @ApiResponse({ status: 403, description: 'Blocked during impersonation' })
   deleteAvatar(@CurrentUser('id') userId: string) {
     return this.authService.deleteAvatar(userId);
+  }
+
+  @Get('me/login-history')
+  @ApiOperation({
+    summary: 'Get recent sign-in history with IP and user agent',
+    description:
+      'Returns a paginated log of recent login attempts (both successful and failed) ' +
+      'for the authenticated user. IPv4 addresses are masked for privacy.',
+  })
+  @ApiResponse({ status: 200, description: 'Login history records' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  getLoginHistory(
+    @CurrentUser() user: any,
+    @Query() query: LoginHistoryQueryDto,
+  ) {
+    return this.authService.getLoginHistory(
+      user.id,
+      user.jti,
+      query?.cursor,
+      query?.limit,
+    );
   }
 
   @Get('me/sessions')

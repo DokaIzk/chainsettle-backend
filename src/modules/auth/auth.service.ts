@@ -23,6 +23,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from '../audit-logs/audit-log.service';
 import { SessionService } from './session.service';
 import { ForceLogoutDto } from './dto/force-logout.dto';
+import { maskIpAddress } from '../../common/utils/ip.util';
 
 /**
  * AuthService
@@ -102,10 +103,12 @@ export class AuthService {
       isValid = keypair.verify(Buffer.from(storedNonce), signatureBuffer);
     } catch (err) {
       this.logger.warn(`Signature verification failed for ${stellarAddress}`);
+      await this.recordFailedLoginIfKnownUser(stellarAddress, ipAddress, userAgent);
       throw new UnauthorizedException('Signature verification failed');
     }
 
     if (!isValid) {
+      await this.recordFailedLoginIfKnownUser(stellarAddress, ipAddress, userAgent);
       throw new UnauthorizedException('Signature verification failed');
     }
 
@@ -131,8 +134,51 @@ export class AuthService {
     // Track this session in Redis so revoke-all can enumerate it
     await this.sessions.registerSession(user.id, jti);
 
+    // Record successful login in audit log
+    await this.auditLog.record({
+      actorId: user.id,
+      actorAddress: user.stellarAddress,
+      action: 'LOGIN_SUCCESS',
+      resourceType: 'User',
+      resourceId: user.id,
+      metadata: {
+        userAgent,
+        sessionId: jti,
+      },
+      ipAddress,
+    });
+
     this.logger.log(`User authenticated: ${stellarAddress}`);
     return { accessToken, user };
+  }
+
+  private async recordFailedLoginIfKnownUser(
+    stellarAddress: string,
+    ipAddress: string,
+    userAgent: string,
+  ): Promise<void> {
+    try {
+      const existingUser = await this.prisma.user.findUnique({
+        where: { stellarAddress },
+        select: { id: true, stellarAddress: true },
+      });
+      if (existingUser) {
+        await this.auditLog.record({
+          actorId: existingUser.id,
+          actorAddress: existingUser.stellarAddress,
+          action: 'LOGIN_FAILED',
+          resourceType: 'User',
+          resourceId: existingUser.id,
+          metadata: {
+            userAgent,
+            reason: 'Signature verification failed',
+          },
+          ipAddress,
+        });
+      }
+    } catch (error) {
+      this.logger.error(`Failed to record LOGIN_FAILED audit log: ${error.message}`);
+    }
   }
 
   async getProfile(userId: string) {
@@ -1004,6 +1050,97 @@ export class AuthService {
     this.logger.log(`Phone verified for user ${userId}: ${pendingPhone}`);
 
     return { message: 'Phone number verified successfully', phoneNumber: pendingPhone };
+  }
+
+  /**
+   * Returns recent login attempts (both successful and failed) for the user,
+   * with masked IPv4 addresses and cursor pagination.
+   */
+  async getLoginHistory(
+    userId: string,
+    currentJti?: string,
+    cursor?: string,
+    limit = 20,
+  ): Promise<{
+    data: Array<{
+      id: string;
+      timestamp: Date;
+      ipAddress: string | null;
+      userAgent: string;
+      success: boolean;
+      isCurrentSession: boolean;
+    }>;
+    meta: {
+      nextCursor: string | null;
+      limit: number;
+    };
+  }> {
+    const take = Math.min(Math.max(1, limit || 20), 100);
+    const where: any = {
+      userId,
+      action: { in: ['LOGIN_SUCCESS', 'LOGIN_FAILED'] },
+    };
+
+    let logs: any[];
+    if (cursor) {
+      let cursorId = cursor;
+      try {
+        const decoded = JSON.parse(Buffer.from(cursor, 'base64').toString('utf-8'));
+        if (decoded?.id) {
+          cursorId = decoded.id;
+        }
+      } catch {
+        // use raw cursor string as id
+      }
+
+      logs = await this.prisma.auditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        cursor: { id: cursorId },
+        skip: 1,
+        take,
+      });
+    } else {
+      logs = await this.prisma.auditLog.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        take,
+      });
+    }
+
+    const nextCursor =
+      logs.length === take
+        ? Buffer.from(
+            JSON.stringify({
+              id: logs[logs.length - 1].id,
+              createdAt: logs[logs.length - 1].createdAt.toISOString(),
+            }),
+          ).toString('base64')
+        : null;
+
+    const data = logs.map((log) => {
+      const metadata = (log.metadata as Record<string, any>) ?? {};
+      const isSuccess = log.action === 'LOGIN_SUCCESS';
+      const isCurrentSession =
+        isSuccess && Boolean(currentJti && metadata.sessionId === currentJti);
+
+      return {
+        id: log.id,
+        timestamp: log.createdAt,
+        ipAddress: maskIpAddress(log.ipAddress),
+        userAgent: metadata.userAgent ?? 'unknown',
+        success: isSuccess,
+        isCurrentSession,
+      };
+    });
+
+    return {
+      data,
+      meta: {
+        nextCursor,
+        limit: take,
+      },
+    };
   }
 
   /**

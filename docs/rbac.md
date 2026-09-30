@@ -55,7 +55,7 @@ These endpoints are **not** gated by `UserRole` — they're gated by whether the
 |---|:---:|:---:|:---:|:---:|:---:|---|
 | Create shipment (`POST /shipments`) | ✅ (as self only) | ❌ | ❌ | ❌ | ✅ (any buyer) | Controller: `dto.buyerAddress` must equal caller's address, unless caller is admin |
 | List shipments (`GET /shipments`) | ✅ (own only) | ✅ (own only) | ✅ (own only) | ✅ (own only) | ✅ (all) | Service scopes to shipments where caller is any participant; admin unscoped + can filter by buyer/supplier address |
-| View shipment detail / participants / tracking / refund / approvals / value time-series / `:id/export` / `calendar.ics` | ✅ (own) | ✅ (own) | ✅ (own) | ✅ (own) | ✅ (any) | `ShipmentParticipantGuard` (admin bypass built in) |
+| View shipment detail / participants / tracking / refund / approvals / value time-series / `:id/export` / `:id/risk` / `calendar.ics` | ✅ (own) | ✅ (own) | ✅ (own) | ✅ (own) | ✅ (any) | `ShipmentParticipantGuard` (admin bypass built in) |
 | Update shipment metadata (`PATCH /shipments/:id`) | ✅ (own) | ❌ | ❌ | ❌ | ❌ *(no bypass)* | Service: `shipment.buyerAddress !== caller` → 403 |
 | Cancel shipment | ✅ (own) | ❌ | ❌ | ❌ | ❌ *(no bypass)* | Service: buyer-only |
 | Clone shipment | ✅ (own) | ❌ | ❌ | ❌ | ❌ *(no bypass)* | Service: buyer-only |
