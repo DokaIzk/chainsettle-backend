@@ -7,6 +7,8 @@ import { APP_FILTER, APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { envValidationSchema } from './config/env.validation';
 import { RolesGuard } from './common/guards/roles.guard';
 import { RateLimitThrottlerGuard } from './common/guards/rate-limit-throttler.guard';
+import { MaintenanceGuard } from './common/guards/maintenance.guard';
+import { ImpersonationGuard } from './common/guards/impersonation.guard';
 
 import { PrismaModule } from './common/prisma/prisma.module';
 import { StellarModule } from './common/stellar/stellar.module';
@@ -16,7 +18,9 @@ import { TokenRegistryModule } from './common/token-registry/token-registry.modu
 import { RedisThrottlerStorageService } from './common/throttler/redis-throttler-storage.service';
 import { MetricsModule } from './common/metrics/metrics.module';
 import { HttpMetricsInterceptor } from './common/interceptors/http-metrics.interceptor';
+import { DeprecationInterceptor } from './common/interceptors/deprecation.interceptor';
 import { FxModule } from './common/fx/fx.module';
+import { AppConfigModule } from './config/app-config.module';
 
 import { AuthModule } from './modules/auth/auth.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
@@ -30,6 +34,7 @@ import { AuditLogsModule } from './modules/audit-logs/audit-logs.module';
 import { AuditLogInterceptor } from './modules/audit-logs/audit-log.interceptor';
 import { WebhooksModule } from './modules/webhooks/webhooks.module';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
+import { LocaleMiddleware } from './common/middleware/locale.middleware';
 import { ChainModule } from './modules/chain/chain.module';
 import { KycModule } from './modules/kyc/kyc.module';
 import { ArbitersModule } from './modules/arbiters/arbiters.module';
@@ -39,6 +44,8 @@ import { GraphqlModule } from './modules/graphql/graphql.module';
 import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
 import { AdminDisputesModule } from './modules/admin-dashboard/admin-disputes.module';
 import { SettlementProposalsModule } from './modules/milestones/settlement-proposals.module';
+import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+import { ThrottlerExceptionFilter } from './common/filters/throttler-exception.filter';
 
 @Module({
   imports: [
@@ -49,6 +56,9 @@ import { SettlementProposalsModule } from './modules/milestones/settlement-propo
       validationSchema: envValidationSchema,
       validationOptions: { abortEarly: false },
     }),
+
+    // AppConfig global module (#424)
+    AppConfigModule,
 
     // Rate limiting — protects all routes with Redis storage for multi-pod consistency
     ThrottlerModule.forRootAsync({
@@ -103,6 +113,11 @@ import { SettlementProposalsModule } from './modules/milestones/settlement-propo
     SettlementProposalsModule,
   ],
   providers: [
+    // Maintenance mode guard — blocks non-GET writes with 503 when maintenance mode enabled (#425)
+    {
+      provide: APP_GUARD,
+      useClass: MaintenanceGuard,
+    },
     // Apply global throttler guard (sets X-RateLimit-* on success and 429)
     {
       provide: APP_GUARD,

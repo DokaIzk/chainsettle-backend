@@ -1,6 +1,8 @@
 import {
   Controller,
   Get,
+  Post,
+  Body,
   Logger,
   UseGuards,
   Sse,
@@ -15,8 +17,10 @@ import { Observable } from 'rxjs';
 import { Response } from 'express';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { AdminDashboardService } from './admin-dashboard.service';
 import { VolumeReportQueryDto } from './dto/volume-report-query.dto';
+import { ToggleMaintenanceDto } from './dto/toggle-maintenance.dto';
 
 @ApiTags('admin')
 @ApiBearerAuth()
@@ -103,5 +107,22 @@ export class AdminDashboardController {
       return res.send(result);
     }
     return res.json(result);
+  }
+
+  /**
+   * POST /api/v1/admin/maintenance
+   *
+   * Enable/disable read-only maintenance mode. Broadcasts SYSTEM_ALERT notification when enabled.
+   */
+  @Post('maintenance')
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({ summary: '[Admin] Toggle read-only maintenance mode' })
+  @ApiResponse({ status: 200, description: 'Maintenance mode updated' })
+  @ApiResponse({ status: 403, description: 'Admin access required' })
+  toggleMaintenance(
+    @Body() dto: ToggleMaintenanceDto,
+    @CurrentUser() user: any,
+  ) {
+    return this.dashboard.toggleMaintenance(dto, user.stellarAddress, user.id);
   }
 }

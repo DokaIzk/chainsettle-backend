@@ -1,9 +1,13 @@
 import { Injectable, Logger, BadRequestException } from '@nestjs/common';
+import { NotificationType } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
 import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
+import { AppConfigService } from '../../config/app-config.service';
+import { NotificationsService } from '../notifications/notifications.service';
 import { VolumeReportQueryDto } from './dto/volume-report-query.dto';
+import { ToggleMaintenanceDto } from './dto/toggle-maintenance.dto';
 import { buildCsvFromRows } from '../../common/utils/csv.util';
 
 export interface DashboardSnapshot {
@@ -36,6 +40,8 @@ export class AdminDashboardService {
     private readonly redis: RedisService,
     private readonly tokenRegistry: TokenRegistryService,
     private readonly fxRate: FxRateService,
+    private readonly appConfig: AppConfigService,
+    private readonly notifications: NotificationsService,
   ) {}
 
   async getSnapshot(): Promise<DashboardSnapshot> {
@@ -148,8 +154,6 @@ export class AdminDashboardService {
     // Build raw SQL query using date_trunc
     const dateTruncUnit = interval; // 'day', 'week', 'month'
     
-    // We select created shipments and completed shipments aggregated by bucket
-    // Note: totalAmount and releasedAmount are BigInt stroops in DB
     const rawCreated: Array<{
       period_start: Date;
       shipments_created: bigint | number;
@@ -202,13 +206,12 @@ export class AdminDashboardService {
     const buckets: VolumeBucket[] = [];
     let curr = new Date(fromDate);
     
-    // Align curr to period start
     if (interval === 'day') {
       curr.setUTCHours(0, 0, 0, 0);
     } else if (interval === 'week') {
       curr.setUTCHours(0, 0, 0, 0);
       const day = curr.getUTCDay();
-      const diff = curr.getUTCDate() - day + (day === 0 ? -6 : 1); // Monday start
+      const diff = curr.getUTCDate() - day + (day === 0 ? -6 : 1);
       curr.setUTCDate(diff);
     } else if (interval === 'month') {
       curr.setUTCHours(0, 0, 0, 0);
@@ -233,7 +236,6 @@ export class AdminDashboardService {
         releasedValue: releasedValHuman.toFixed(tokenDecimals),
       });
 
-      // Increment curr
       if (interval === 'day') {
         curr.setUTCDate(curr.getUTCDate() + 1);
       } else if (interval === 'week') {
@@ -252,11 +254,37 @@ export class AdminDashboardService {
         totalValueUsd: b.totalValueUsd,
         releasedValue: b.releasedValue,
       })));
-      await this.redis.set(cacheKey, csvStr, 600); // 10 minutes cache
+      await this.redis.set(cacheKey, csvStr, 600);
       return csvStr;
     }
 
-    await this.redis.set(cacheKey, JSON.stringify(buckets), 600); // 10 minutes cache
+    await this.redis.set(cacheKey, JSON.stringify(buckets), 600);
     return buckets;
+  }
+
+  async toggleMaintenance(dto: ToggleMaintenanceDto, actorAddress: string, actorId?: string) {
+    const val = {
+      enabled: dto.enabled,
+      message: dto.message || 'System is under scheduled maintenance. Writes are temporarily disabled.',
+      until: dto.until || null,
+    };
+
+    const updated = await this.appConfig.updateValue('maintenance', val, actorAddress, actorId);
+
+    if (dto.enabled) {
+      // Broadcast SYSTEM_ALERT to all active users when maintenance is enabled
+      const users = await this.prisma.user.findMany({ select: { stellarAddress: true } });
+      for (const u of users) {
+        this.notifications.notifyUser(
+          u.stellarAddress,
+          NotificationType.SYSTEM_ALERT,
+          'System Maintenance Mode Enabled',
+          val.message,
+          { urgent: true, maintenanceUntil: val.until },
+        ).catch(() => {});
+      }
+    }
+
+    return updated;
   }
 }
