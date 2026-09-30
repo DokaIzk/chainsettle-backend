@@ -30,6 +30,7 @@ import { parse } from 'csv-parse/sync';
 import Ajv from 'ajv';
 import { metadataSchemas } from './schemas/metadata.schemas';
 import { pickFields } from './shipment-fields';
+import { computeShipmentRisk, RiskLevel, ShipmentRiskResult } from './utils/risk.util';
 
 const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -272,6 +273,8 @@ export class ShipmentsService {
     fields?: string[];
     /** ISO-4217 display currency for FX-converted values. Defaults to 'USD'. */
     displayCurrency?: string;
+    /** Computed risk level filter (LOW, MEDIUM, HIGH). */
+    riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
   }) {
     const {
       buyerAddress,
@@ -295,6 +298,7 @@ export class ShipmentsService {
       callerUserId,
       fields,
       displayCurrency = 'USD',
+      riskLevel,
     } = filters;
 
     if (cursor && page && page !== 1) {
@@ -368,12 +372,23 @@ export class ShipmentsService {
       ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
       : {};
 
+    const riskInclude = riskLevel
+      ? {
+          buyer: { select: { id: true, stellarAddress: true, kycStatus: true } },
+          supplier: { select: { id: true, stellarAddress: true, kycStatus: true } },
+          logistics: { select: { id: true, stellarAddress: true, kycStatus: true } },
+          arbiter: { select: { id: true, stellarAddress: true, kycStatus: true } },
+          trackingUpdates: { orderBy: { createdAt: 'desc' as const }, take: 1 },
+          comments: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' as const }, take: 1 },
+        }
+      : {};
+
     // Sparse fieldsets (#390): push the selection into Prisma rather than
     // trimming afterwards. When no fields are requested, keep the full include.
     const milestonesQuery = { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } };
     const projection: any = fields
-      ? { select: this.buildSelect(fields, { milestones: milestonesQuery, ...favoriteInclude }) }
-      : { include: { milestones: milestonesQuery, ...favoriteInclude } };
+      ? { select: this.buildSelect(fields, { milestones: milestonesQuery, ...favoriteInclude, ...riskInclude }) }
+      : { include: { milestones: milestonesQuery, ...favoriteInclude, ...riskInclude } };
 
     let shipments: any[];
     let total: number | null = null;
@@ -477,6 +492,13 @@ export class ShipmentsService {
       ]);
     }
 
+    if (riskLevel) {
+      shipments = shipments.filter((s) => computeShipmentRisk(s).level === riskLevel);
+      if (total !== null) {
+        total = shipments.length;
+      }
+    }
+
     return {
       data: await Promise.all(
         shipments.map(async (s) => {
@@ -514,6 +536,31 @@ export class ShipmentsService {
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
     const serialized = await this.serialize(shipment, callerUserId, precisionOverride, displayCurrency);
     return fields ? pickFields(serialized, fields) : serialized;
+  }
+
+  /**
+   * Evaluates computed risk indicators and derives overall risk level for a shipment.
+   */
+  async getShipmentRisk(id: string): Promise<ShipmentRiskResult> {
+    const db = this.prisma.read;
+    const shipment: any = await db.shipment.findUnique({
+      where: { id },
+      include: {
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        trackingUpdates: { orderBy: { createdAt: 'desc' }, take: 1 },
+        comments: { where: { deletedAt: null }, orderBy: { createdAt: 'desc' }, take: 1 },
+        buyer: { select: { id: true, stellarAddress: true, kycStatus: true } },
+        supplier: { select: { id: true, stellarAddress: true, kycStatus: true } },
+        logistics: { select: { id: true, stellarAddress: true, kycStatus: true } },
+        arbiter: { select: { id: true, stellarAddress: true, kycStatus: true } },
+      },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    return computeShipmentRisk(shipment);
   }
 
   /**

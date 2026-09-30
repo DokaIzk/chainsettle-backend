@@ -102,6 +102,32 @@ export interface paths {
       };
     };
   };
+  '/api/v1/shipments/{id}/risk': {
+    get: {
+      parameters: {
+        path: { id: string };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              shipmentId: string;
+              level: 'LOW' | 'MEDIUM' | 'HIGH';
+              reasons: string[];
+              indicators: {
+                overdueMilestones: number;
+                openDisputes: number;
+                arbiterNotAccepted: boolean;
+                daysSinceLastActivity: number;
+                unverifiedCounterparties: number;
+              };
+              evaluatedAt: string;
+            };
+          };
+        };
+      };
+    };
+  };
   '/api/v1/notifications': {
     get: {
       responses: {
@@ -205,6 +231,36 @@ export interface paths {
               success?: boolean;
               data?: unknown;
               timestamp?: string;
+            };
+          };
+        };
+      };
+    };
+  };
+  '/api/v1/users/me/login-history': {
+    get: {
+      parameters?: {
+        query?: {
+          cursor?: string;
+          limit?: number;
+        };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              data: Array<{
+                id: string;
+                timestamp: string;
+                ipAddress?: string | null;
+                userAgent: string;
+                success: boolean;
+                isCurrentSession: boolean;
+              }>;
+              meta: {
+                nextCursor?: string | null;
+                limit: number;
+              };
             };
           };
         };

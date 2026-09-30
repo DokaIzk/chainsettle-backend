@@ -144,4 +144,16 @@ export class FindAllShipmentsDto {
     message: `currency must be one of: ${SUPPORTED_CURRENCIES.join(', ')}`,
   })
   currency?: string;
+
+  @ApiPropertyOptional({
+    description: 'Filter shipments by computed risk level (LOW, MEDIUM, HIGH)',
+    enum: ['LOW', 'MEDIUM', 'HIGH'],
+    example: 'HIGH',
+  })
+  @IsOptional()
+  @Transform(({ value }) => (typeof value === 'string' ? value.toUpperCase() : value))
+  @IsIn(['LOW', 'MEDIUM', 'HIGH'], {
+    message: 'riskLevel must be one of: LOW, MEDIUM, HIGH',
+  })
+  riskLevel?: 'LOW' | 'MEDIUM' | 'HIGH';
 }
