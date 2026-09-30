@@ -469,6 +469,119 @@ onModuleInit() {
     };
   }
 
+  // ----------------------------------------------------------
+  // TRANSACTION STATUS LOOKUP
+  // ----------------------------------------------------------
+
+  /**
+   * Fetches the status and metadata of a submitted Stellar transaction
+   * directly from the Soroban RPC.
+   *
+   * Possible status values returned by the RPC:
+   *  - SUCCESS    — transaction was included in a ledger and succeeded
+   *  - FAILED     — transaction was included but its operation(s) failed
+   *  - NOT_FOUND  — hash is unknown; may still be in the mempool (PENDING) or invalid
+   *
+   * The caller maps NOT_FOUND to a PENDING/NOT_FOUND distinction.
+   * This method never throws for known statuses — it always returns a typed object.
+   *
+   * @param txHash  64-character hex transaction hash
+   */
+  async getTransaction(txHash: string): Promise<{
+    hash: string;
+    status: 'SUCCESS' | 'FAILED' | 'PENDING' | 'NOT_FOUND';
+    ledger: number | null;
+    createdAt: string | null;
+    feeCharged: string | null;
+    resultCode: string | null;
+    envelopeXdr: string | null;
+    resultXdr: string | null;
+    events: any[];
+  }> {
+    return withSpan(
+      'stellar.getTransaction',
+      async (span) => {
+        span.setAttribute('stellar.tx_hash', txHash);
+
+        try {
+          const tx = await this.rpcClient.getTransaction(txHash);
+          span.setAttribute('stellar.tx_status', tx.status);
+
+          if (tx.status === 'NOT_FOUND') {
+            return {
+              hash: txHash,
+              status: 'NOT_FOUND' as const,
+              ledger: null,
+              createdAt: null,
+              feeCharged: null,
+              resultCode: null,
+              envelopeXdr: null,
+              resultXdr: null,
+              events: [],
+            };
+          }
+
+          // Extract result code from resultXdr when available
+          let resultCode: string | null = null;
+          if (tx.resultXdr) {
+            try {
+              const result = (tx.resultXdr as any).result?.();
+              resultCode = result?.switch?.().name ?? null;
+            } catch {
+              // resultXdr may not be a parsed XDR object in all SDK versions
+              resultCode = null;
+            }
+          }
+
+          // Extract fee from envelopeXdr when available
+          let feeCharged: string | null = null;
+          if (tx.envelopeXdr) {
+            try {
+              const fee = (tx.envelopeXdr as any).tx?.().fee?.();
+              feeCharged = fee != null ? String(fee) : null;
+            } catch {
+              feeCharged = null;
+            }
+          }
+
+          // Decode createdAt from ledger close time when available
+          const createdAt: string | null =
+            (tx as any).createdAt
+              ? new Date((tx as any).createdAt * 1000).toISOString()
+              : null;
+
+          // Decode contract events on success
+          let events: any[] = [];
+          if (tx.status === 'SUCCESS') {
+            try {
+              events = await this.getTransactionEvents(txHash);
+            } catch {
+              // Non-fatal — event decoding failure should not block the status response
+              events = [];
+            }
+          }
+
+          return {
+            hash: txHash,
+            status: tx.status as 'SUCCESS' | 'FAILED',
+            ledger: tx.ledger ?? null,
+            createdAt,
+            feeCharged,
+            resultCode,
+            envelopeXdr: tx.envelopeXdr ? String(tx.envelopeXdr) : null,
+            resultXdr: tx.resultXdr ? String(tx.resultXdr) : null,
+            events,
+          };
+        } catch (error) {
+          this.logger.error(`getTransaction(${txHash}) failed: ${error.message}`);
+          throw error;
+        }
+      },
+      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      SpanKind.CLIENT,
+    );
+  }
+
   /**
    * Fetches the transaction's result meta from Soroban RPC and decodes
    * any events emitted by our contract.
