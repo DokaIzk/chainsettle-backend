@@ -34,6 +34,7 @@ import { ChainModule } from './modules/chain/chain.module';
 import { KycModule } from './modules/kyc/kyc.module';
 import { ArbitersModule } from './modules/arbiters/arbiters.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
+import { InvitationsModule } from './modules/invitations/invitations.module';
 import { GraphqlModule } from './modules/graphql/graphql.module';
 import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
 import { AdminDisputesModule } from './modules/admin-dashboard/admin-disputes.module';
@@ -94,6 +95,7 @@ import { SettlementProposalsModule } from './modules/milestones/settlement-propo
     ChainModule,
     KycModule,
     ArbitersModule,
+    InvitationsModule,
     FeatureFlagsModule,
     GraphqlModule,
     AdminDashboardModule,

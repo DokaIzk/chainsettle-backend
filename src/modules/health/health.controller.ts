@@ -26,6 +26,7 @@ export class HealthController {
     private readonly prismaHealth: PrismaHealthIndicator,
     private readonly prisma: PrismaService,
     private readonly ipfsService: IpfsService,
+    private readonly stellar: StellarService,
   ) {}
 
   /**
@@ -74,6 +75,31 @@ export class HealthController {
       () => this.prismaHealth.pingCheck('database', this.prisma),
       () => this.ipfsHealthCheck(),
     ]);
+  }
+
+  /**
+   * GET /health/detailed
+   * Dependency health plus the active Stellar RPC/Horizon endpoint and the
+   * health of every configured failover endpoint.
+   */
+  @Get('detailed')
+  @ApiOperation({ summary: 'Detailed health including Stellar RPC/Horizon failover state' })
+  async detailed() {
+    let database = 'up';
+    try {
+      await this.prisma.$queryRaw`SELECT 1`;
+    } catch {
+      database = 'down';
+    }
+    const stellar = this.stellar.getEndpointHealth();
+    const stellarUp =
+      stellar.rpc.endpoints.some((e) => e.healthy) && stellar.horizon.endpoints.some((e) => e.healthy);
+    return {
+      status: database === 'up' && stellarUp ? 'ok' : 'degraded',
+      database,
+      ipfs: this.ipfsService.isHealthy ? 'up' : 'down',
+      stellar,
+    };
   }
 
   /**

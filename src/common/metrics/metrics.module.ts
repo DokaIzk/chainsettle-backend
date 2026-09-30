@@ -10,6 +10,7 @@ import {
   EVENTS_FAILED_COUNTER,
   SHIPMENTS_CREATED_COUNTER,
   ACTIVE_SHIPMENTS_GAUGE,
+  STELLAR_ENDPOINT_GAUGE,
   SHIPMENTS_BY_STATUS_GAUGE,
   OPEN_DISPUTES_GAUGE,
   DISPUTE_RESOLUTION_TIME_HISTOGRAM,
@@ -69,6 +70,11 @@ export async function collectOpenDisputes(this: Gauge<string>, prisma: PrismaSer
     makeGaugeProvider({
       name: ACTIVE_SHIPMENTS_GAUGE,
       help: 'Current number of active shipments',
+    }),
+    makeGaugeProvider({
+      name: STELLAR_ENDPOINT_GAUGE,
+      help: 'Stellar RPC/Horizon endpoint health (1 = healthy); active="true" marks the endpoint in use',
+      labelNames: ['type', 'url', 'active'],
     }),
     makeGaugeProvider({
       name: OPEN_DISPUTES_GAUGE,

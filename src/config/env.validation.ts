@@ -34,8 +34,12 @@ export const envValidationSchema = Joi.object({
 
   // Stellar
   STELLAR_NETWORK: Joi.string().valid('testnet', 'mainnet', 'futurenet').default('testnet'),
-  STELLAR_RPC_URL: Joi.string().uri().required(),
-  STELLAR_HORIZON_URL: Joi.string().uri().required(),
+  STELLAR_RPC_URL: Joi.string().uri(),
+  STELLAR_HORIZON_URL: Joi.string().uri(),
+  // Comma-separated failover lists; take precedence over the single-URL vars
+  STELLAR_RPC_URLS: Joi.string(),
+  STELLAR_HORIZON_URLS: Joi.string(),
+  STELLAR_HEALTH_INTERVAL_MS: Joi.number().integer().min(1000).default(15000),
   CHAINSETTTLE_CONTRACT_ID: Joi.string().required(),
   USDC_TOKEN_ADDRESS: Joi.string().required(),
   STELLAR_SECRET_KEY: Joi.string().required(),
@@ -112,4 +116,7 @@ export const envValidationSchema = Joi.object({
   // Defaults to the cache TTL window (5 minutes). Stale rates are still served
   // but the response includes `stale: true` so clients can warn users.
   FX_STALE_AFTER_MINUTES: Joi.number().integer().min(1).default(10),
-}).options({ allowUnknown: true });
+})
+  .or('STELLAR_RPC_URL', 'STELLAR_RPC_URLS')
+  .or('STELLAR_HORIZON_URL', 'STELLAR_HORIZON_URLS')
+  .options({ allowUnknown: true });
