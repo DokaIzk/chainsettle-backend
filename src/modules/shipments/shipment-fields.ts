@@ -24,6 +24,7 @@ export const SHIPMENT_SCALAR_FIELDS = [
   'referenceNumber',
   'metadata',
   'tags',
+  'expectedDeliveryAt',
   'cancelledAt',
   'refundTxHash',
   'isDraft',

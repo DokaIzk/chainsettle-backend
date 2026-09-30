@@ -1,30 +1,5 @@
-import {
-  Controller,
-  Get,
-  Patch,
-  Post,
-  Put,
-  Delete,
-  Body,
-  UseGuards,
-  HttpCode,
-  HttpStatus,
-  Req,
-  Param,
-  UseInterceptors,
-  UploadedFile,
-  BadRequestException,
-} from '@nestjs/common';
-import {
-  ApiTags,
-  ApiOperation,
-  ApiResponse,
-  ApiBearerAuth,
-  ApiConsumes,
-  ApiBody,
-} from '@nestjs/swagger';
-import { FileInterceptor } from '@nestjs/platform-express';
-import { memoryStorage } from 'multer';
+import { Controller, Get, Patch, Post, Body, UseGuards, HttpCode, HttpStatus, Req, Param } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth, ApiParam } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { SessionService } from './session.service';
 import { UpdateProfileDto } from './dto/update-profile.dto';
@@ -247,9 +222,19 @@ export class UsersController {
     return this.authService.verifyPhone(userId, dto.otp);
   }
 
+  /**
+   * GET /users/:stellarAddress
+   *
+   * Returns the public-facing profile for any registered user identified by
+   * their Stellar address. Only non-sensitive fields are exposed: Stellar
+   * address, display name, organisation name, country code, role, and
+   * account creation date.
+   */
   @Get(':stellarAddress')
-  @ApiOperation({ summary: 'Get a public user profile by Stellar address' })
-  @ApiResponse({ status: 200, description: 'Public user profile returned' })
+  @ApiOperation({ summary: 'Get public profile for a user by Stellar address' })
+  @ApiParam({ name: 'stellarAddress', description: 'Stellar public key of the target user' })
+  @ApiResponse({ status: 200, description: 'Public user profile' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
   @ApiResponse({ status: 404, description: 'User not found' })
   getPublicProfile(@Param('stellarAddress') stellarAddress: string) {
     return this.authService.getPublicProfile(stellarAddress);

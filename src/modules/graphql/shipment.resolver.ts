@@ -74,6 +74,7 @@ export class ShipmentResolver {
       releasedAmount: s.releasedAmount?.toString() ?? '0',
       description: s.description ?? undefined,
       referenceNumber: s.referenceNumber ?? undefined,
+      expectedDeliveryAt: s.expectedDeliveryAt ?? undefined,
       createdAt: s.createdAt,
       milestones: [],
       recentEvents: s.events ?? [],

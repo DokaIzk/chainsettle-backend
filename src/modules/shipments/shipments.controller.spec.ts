@@ -116,6 +116,26 @@ describe('ShipmentsController (RBAC)', () => {
         expect(result).toEqual(cached);
         expect(mockService.create).not.toHaveBeenCalled();
     });
+
+    it('delegates GET /shipments/:id/documents to shipmentsService.getDocuments', async () => {
+        const mockDocuments = [{ source: 'PROOF', cid: 'Qm123', downloadUrl: '/api/v1/ipfs/Qm123' }];
+        const mockService: Partial<ShipmentsService> = {
+            getDocuments: jest.fn().mockResolvedValue(mockDocuments),
+        };
+
+        const controller = new ShipmentsController(
+            mockService as ShipmentsService,
+            mockApprovals as ShipmentApprovalsService,
+            mockSavedFilters as SavedFiltersService,
+            mockRedis as RedisService,
+            {} as any,
+            {} as any,
+        );
+
+        const result = await controller.getDocuments('SHIP-1', { source: 'PROOF' }, { stellarAddress: 'GBUY-ME', role: 'BUYER' });
+        expect(result).toEqual(mockDocuments);
+        expect(mockService.getDocuments).toHaveBeenCalledWith('SHIP-1', 'GBUY-ME', false, 'PROOF');
+    });
 });
 
 

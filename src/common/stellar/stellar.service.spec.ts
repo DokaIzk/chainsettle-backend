@@ -231,3 +231,103 @@ describe('StellarService — getTransactionEvents', () => {
   });
 });
 
+
+// ------------------------------------------------------------------
+// StellarService — getTransaction
+// ------------------------------------------------------------------
+
+describe('StellarService — getTransaction', () => {
+  let service: StellarService;
+  let mockRpcClient: jest.Mocked<{ getTransaction: jest.Mock }>;
+
+  beforeEach(() => {
+    const config = {
+      get: jest.fn((key: string) => {
+        if (key === 'STELLAR_RPC_URL') return 'https://mock-rpc.org';
+        if (key === 'STELLAR_HORIZON_URL') return 'https://mock-horizon.org';
+        if (key === 'STELLAR_NETWORK') return 'testnet';
+        if (key === 'CHAINSETTTLE_CONTRACT_ID') return 'C1234567890';
+        return undefined;
+      }),
+    } as unknown as ConfigService;
+
+    service = new StellarService(config);
+    service.onModuleInit();
+
+    mockRpcClient = { getTransaction: jest.fn() };
+    (service as any).rpcClient = mockRpcClient;
+  });
+
+  it('returns status NOT_FOUND when the RPC reports NOT_FOUND', async () => {
+    mockRpcClient.getTransaction.mockResolvedValue({ status: 'NOT_FOUND' });
+
+    const result = await service.getTransaction('a'.repeat(64));
+
+    expect(result.status).toBe('NOT_FOUND');
+    expect(result.ledger).toBeNull();
+    expect(result.events).toEqual([]);
+  });
+
+  it('returns status FAILED with ledger when the RPC reports FAILED', async () => {
+    mockRpcClient.getTransaction.mockResolvedValue({
+      status: 'FAILED',
+      ledger: 42,
+      envelopeXdr: null,
+      resultXdr: null,
+    });
+
+    const result = await service.getTransaction('b'.repeat(64));
+
+    expect(result.status).toBe('FAILED');
+    expect(result.ledger).toBe(42);
+    expect(result.events).toEqual([]);
+    expect(result.envelopeXdr).toBeNull();
+  });
+
+  it('returns status SUCCESS with ledger and empty events when no resultMetaXdr', async () => {
+    mockRpcClient.getTransaction.mockResolvedValue({
+      status: 'SUCCESS',
+      ledger: 100,
+      resultMetaXdr: undefined,
+      envelopeXdr: null,
+      resultXdr: null,
+    });
+
+    const result = await service.getTransaction('c'.repeat(64));
+
+    expect(result.status).toBe('SUCCESS');
+    expect(result.ledger).toBe(100);
+    // getTransactionEvents will return [] because resultMetaXdr is missing
+    expect(result.events).toEqual([]);
+  });
+
+  it('includes createdAt in ISO format when RPC returns a unix createdAt', async () => {
+    const unixTs = 1_700_000_000; // 2023-11-14T…
+    mockRpcClient.getTransaction.mockResolvedValue({
+      status: 'FAILED',
+      ledger: 7,
+      createdAt: unixTs,
+      envelopeXdr: null,
+      resultXdr: null,
+    });
+
+    const result = await service.getTransaction('d'.repeat(64));
+
+    expect(result.createdAt).toBe(new Date(unixTs * 1000).toISOString());
+  });
+
+  it('sets hash to the provided txHash in every case', async () => {
+    const hash = 'e'.repeat(64);
+    mockRpcClient.getTransaction.mockResolvedValue({ status: 'NOT_FOUND' });
+
+    const result = await service.getTransaction(hash);
+
+    expect(result.hash).toBe(hash);
+  });
+
+  it('re-throws unexpected errors from the RPC client', async () => {
+    mockRpcClient.getTransaction.mockRejectedValue(new Error('network timeout'));
+
+    await expect(service.getTransaction('f'.repeat(64))).rejects.toThrow('network timeout');
+  });
+});
