@@ -37,7 +37,11 @@ export class DisputeEscalationJob {
         },
         include: {
           shipment: {
-            select: { id: true, arbiterAddress: true },
+            select: {
+              id: true,
+              arbiterAddress: true,
+              arbiter: { select: { arbiterAwayUntil: true, awayMessage: true } },
+            },
           },
         },
       });
@@ -74,9 +78,13 @@ export class DisputeEscalationJob {
     try {
       const { shipment, milestoneIndex, id } = milestone;
 
+      const awayUntil: Date | null = shipment.arbiter?.arbiterAwayUntil ?? null;
+      const arbiterAway = !!awayUntil && awayUntil > new Date();
+
       const title = `Unresolved dispute — shipment ${shipment.id} milestone ${milestoneIndex}`;
       const message =
-        `Dispute on shipment ${shipment.id} milestone ${milestoneIndex} has been unresolved for over ${days} days. Arbiter: ${shipment.arbiterAddress}.`;
+        `Dispute on shipment ${shipment.id} milestone ${milestoneIndex} has been unresolved for over ${days} days. Arbiter: ${shipment.arbiterAddress}.` +
+        (arbiterAway ? ` The arbiter is marked away until ${awayUntil!.toISOString()}.` : '');
 
       for (const admin of admins) {
         await this.notifications.notifyUser(
@@ -88,6 +96,8 @@ export class DisputeEscalationJob {
             shipmentId: shipment.id,
             milestoneIndex,
             arbiterAddress: shipment.arbiterAddress,
+            arbiterAway,
+            arbiterAwayUntil: arbiterAway ? awayUntil!.toISOString() : null,
           },
         );
       }

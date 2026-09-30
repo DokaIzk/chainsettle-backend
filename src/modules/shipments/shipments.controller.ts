@@ -42,13 +42,21 @@ import { CreateTrackingDto } from './dto/tracking.dto';
 import { FindAllShipmentsDto } from './dto/find-all-shipments.dto';
 import { AddTagDto } from './dto/tag.dto';
 import { NoteDto } from './dto/note.dto';
+import { FindShipmentDocumentsDto } from './dto/shipment-document.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { ValidateMetadataDto } from './dto/metadata.dto';
 import { ShipmentParticipantGuard } from './guards/shipment-participant.guard';
+import { ShipmentReadAccessGuard } from './guards/shipment-read-access.guard';
+import { OrganizationsService } from '../organizations/organizations.service';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { UserRole } from '@prisma/client';
+import { parseFields, SHIPMENT_LIST_FIELDS, SHIPMENT_DETAIL_FIELDS } from './shipment-fields';
 import { RedisService } from '../../common/redis/redis.service';
+import { ShipmentRemindersService } from './shipment-reminders.service';
+import { CreateShipmentReminderDto } from './dto/shipment-reminder.dto';
+import { AuthService } from '../auth/auth.service';
+import { SUPPORTED_CURRENCIES } from '../../common/fx/fx-rate.service';
 
 @ApiTags('shipments')
 @ApiBearerAuth()
@@ -60,6 +68,8 @@ export class ShipmentsController {
     private readonly shipmentApprovals: ShipmentApprovalsService,
     private readonly savedFilters: SavedFiltersService,
     private readonly redis: RedisService,
+    private readonly reminders: ShipmentRemindersService,
+    private readonly authService: AuthService,
   ) { }
 
   /**
@@ -114,6 +124,19 @@ export class ShipmentsController {
   }
 
   /**
+   * POST /api/v1/shipments/duplicate-check
+   * Warns about likely duplicates before the buyer signs the on-chain tx (#388).
+   * Takes the same body as create; has no side effects.
+   */
+  @Post('duplicate-check')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: "Find the caller's ACTIVE shipments that look like duplicates" })
+  @ApiResponse({ status: 200, description: '{ possibleDuplicates: [{ id, createdAt, referenceNumber, matchReasons }] }' })
+  duplicateCheck(@Body() dto: CreateShipmentDto, @CurrentUser() user: any) {
+    return this.shipmentsService.findPossibleDuplicates(user.stellarAddress, dto);
+  }
+
+  /**
    * GET /api/v1/shipments
    * List shipments with optional filters and date ranges. Users see only their own shipments.
    */
@@ -141,9 +164,21 @@ export class ShipmentsController {
     }
 
     const isAdmin = user?.role === UserRole.ADMIN;
+    // Org view (#435): membership is checked on every request, so removed
+    // members lose access immediately.
+    const participantAddresses = query.organizationId
+      ? await this.organizations.getMemberAddresses(query.organizationId, user.id)
+      : undefined;
     const tags = query.tags ? query.tags.split(',').map((t) => t.trim()).filter(Boolean) : undefined;
 
-    return this.shipmentsService.findAll({
+    const fields = parseFields(query.fields, SHIPMENT_LIST_FIELDS);
+
+    // Currency resolution: ?currency= overrides the user's saved preference.
+    // Users without a stored preference fall back to 'USD'.
+    const userCurrency = await this.authService.getUserDisplayCurrency(user?.id);
+    const displayCurrency = query.currency ?? userCurrency;
+
+    return this.shipmentsService.findAllCached({
       buyerAddress: isAdmin ? query.buyerAddress : undefined,
       supplierAddress: isAdmin ? query.supplierAddress : undefined,
       status: query.status,
@@ -163,6 +198,8 @@ export class ShipmentsController {
       isDraft: query.isDraft,
       favorite: query.favorite,
       callerUserId: user?.id,
+      fields,
+      displayCurrency,
     });
   }
 
@@ -318,8 +355,18 @@ export class ShipmentsController {
   @ApiResponse({ status: 200, description: 'Shipment tags replaced successfully' })
   @ApiResponse({ status: 400, description: 'Invalid tag list' })
   @ApiResponse({ status: 403, description: 'Not a shipment participant' })
-  replaceTags(@Param('id') id: string, @Body() body: { tags: string[] }, @CurrentUser() user: any) {
-    return this.shipmentsService.replaceTags(id, body?.tags, user?.stellarAddress, user?.id);
+  @ApiResponse({ status: 412, description: 'If-Match does not match the current ETag' })
+  @ApiHeader({ name: 'If-Match', required: false, description: 'ETag from GET /shipments/:id' })
+  async replaceTags(
+    @Param('id') id: string,
+    @Body() body: { tags: string[] },
+    @CurrentUser() user: any,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('if-match') ifMatch?: string,
+  ) {
+    const result = await this.shipmentsService.replaceTags(id, body?.tags, user?.stellarAddress, user?.id, ifMatch);
+    res.setHeader('ETag', await this.shipmentsService.getEtag(id));
+    return result;
   }
 
   /**
@@ -366,16 +413,65 @@ export class ShipmentsController {
   }
 
   /**
+   * GET /api/v1/shipments/:id/documents
+   * Return every IPFS document linked to a shipment (proofs, dispute evidence, comment attachments).
+   * Restricted to shipment participants. Respects comment visibility rules.
+   */
+  @Get(':id/documents')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get all IPFS documents attached to a shipment' })
+  @ApiQuery({ name: 'source', required: false, enum: ['PROOF', 'DISPUTE_EVIDENCE', 'COMMENT'], description: 'Filter by document source' })
+  @ApiResponse({ status: 200, description: 'List of documents attached to the shipment' })
+  @ApiResponse({ status: 403, description: 'Not a shipment participant' })
+  @ApiResponse({ status: 404, description: 'Shipment not found' })
+  getDocuments(
+    @Param('id') id: string,
+    @Query() query: FindShipmentDocumentsDto,
+    @CurrentUser() user: any,
+  ) {
+    const callerAddress = user?.stellarAddress ?? user?.sub;
+    const isAdmin = user?.role === UserRole.ADMIN;
+    return this.shipmentsService.getDocuments(id, callerAddress, isAdmin, query?.source);
+  }
+
+  /**
    * GET /api/v1/shipments/:id
    * Full shipment detail including milestones and recent on-chain events.
    */
   @Get(':id')
-  @UseGuards(ShipmentParticipantGuard)
+  @UseGuards(ShipmentReadAccessGuard)
   @ApiOperation({ summary: 'Get full shipment details including milestones and events' })
   @ApiResponse({ status: 200, description: 'Shipment found' })
   @ApiResponse({ status: 404, description: 'Shipment not found' })
-  findOne(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.findOne(id, user?.id);
+  @ApiQuery({ name: 'precision', required: false, type: Number, description: 'Override decimal places for FX-converted values (e.g. 0 for JPY, 2 for USD). Defaults to currency-appropriate value.' })
+  @ApiQuery({ name: 'fields', required: false, type: String, description: `Comma-separated sparse fieldset; id is always included. Valid: ${SHIPMENT_DETAIL_FIELDS.join(', ')}` })
+  @ApiQuery({ name: 'currency', required: false, type: String, description: `Override display currency for FX-converted values on this request. Supported: ${SUPPORTED_CURRENCIES.join(', ')}. Defaults to the user's saved preference.` })
+  @ApiResponse({ status: 400, description: 'Unknown field requested' })
+  async findOne(
+    @Param('id') id: string,
+    @CurrentUser() user: any,
+    @Query('precision') precision?: string,
+    @Query('fields') fieldsRaw?: string,
+    @Query('currency') currencyOverride?: string,
+  ) {
+    const precisionOverride = precision !== undefined ? parseInt(precision, 10) : undefined;
+    const fields = parseFields(fieldsRaw, SHIPMENT_DETAIL_FIELDS);
+    const userCurrency = await this.authService.getUserDisplayCurrency(user?.id);
+    const displayCurrency = currencyOverride?.toUpperCase() ?? userCurrency;
+    return this.shipmentsService.findOne(id, user?.id, precisionOverride, fields, displayCurrency);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/history/:auditId/diff
+   * Field-level `[{ field, before, after }]` for one audit entry (#436).
+   */
+  @Get(':id/history/:auditId/diff')
+  @UseGuards(ShipmentReadAccessGuard)
+  @ApiOperation({ summary: 'Field-level before/after diff for a shipment audit entry' })
+  @ApiResponse({ status: 200, description: 'List of changed fields (empty for legacy entries)' })
+  @ApiResponse({ status: 404, description: 'Audit entry not found for this shipment' })
+  getHistoryDiff(@Param('id') id: string, @Param('auditId') auditId: string, @CurrentUser() user: any) {
+    return this.shipmentsService.getHistoryDiff(id, auditId, user?.role === UserRole.ADMIN);
   }
 
   /**
@@ -601,8 +697,57 @@ export class ShipmentsController {
   @ApiResponse({ status: 200, description: 'Shipment updated successfully' })
   @ApiResponse({ status: 403, description: 'Only buyer can update' })
   @ApiResponse({ status: 409, description: 'Reference number already in use' })
-  update(@Param('id') id: string, @Body() dto: UpdateShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.update(id, user.stellarAddress, dto);
+  @ApiResponse({ status: 412, description: 'If-Match does not match the current ETag' })
+  @ApiHeader({ name: 'If-Match', required: false, description: 'ETag from GET /shipments/:id (required when SHIPMENT_REQUIRE_IF_MATCH=true)' })
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateShipmentDto,
+    @CurrentUser() user: any,
+    @Res({ passthrough: true }) res: Response,
+    @Headers('if-match') ifMatch?: string,
+  ) {
+    const result = await this.shipmentsService.update(id, user.stellarAddress, dto, ifMatch);
+    res.setHeader('ETag', await this.shipmentsService.getEtag(id));
+    return result;
+  }
+
+  /**
+   * POST /api/v1/shipments/:id/reminders
+   * Create a personal reminder on a shipment (#386). Private to the caller.
+   */
+  @Post(':id/reminders')
+  @UseGuards(ShipmentParticipantGuard)
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Create a personal reminder on a shipment' })
+  @ApiResponse({ status: 400, description: 'remindAt in the past or reminder limit reached' })
+  createReminder(@Param('id') id: string, @Body() dto: CreateShipmentReminderDto, @CurrentUser() user: any) {
+    return this.reminders.create(id, user.id, dto);
+  }
+
+  /**
+   * GET /api/v1/shipments/:id/reminders
+   * List the caller's own reminders on a shipment.
+   */
+  @Get(':id/reminders')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: "List the caller's reminders on a shipment" })
+  listReminders(@Param('id') id: string, @CurrentUser() user: any) {
+    return this.reminders.list(id, user.id);
+  }
+
+  /**
+   * DELETE /api/v1/shipments/:id/reminders/:reminderId
+   */
+  @Delete(':id/reminders/:reminderId')
+  @UseGuards(ShipmentParticipantGuard)
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Delete one of the caller\'s reminders' })
+  async deleteReminder(
+    @Param('id') id: string,
+    @Param('reminderId') reminderId: string,
+    @CurrentUser() user: any,
+  ) {
+    await this.reminders.remove(id, reminderId, user.id);
   }
 
   /**
@@ -618,6 +763,12 @@ export class ShipmentsController {
     return this.shipmentsService.arbiterAccept(id, user.stellarAddress);
   }
 
+  @Post(':id/arbiter/replace')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Replace a declined or pending shipment arbiter' })
+  replaceArbiter(@Param('id') id: string, @Body('arbiterAddress') arbiterAddress: string, @CurrentUser() user: any) {
+    return this.shipmentsService.replaceArbiter(id, user.stellarAddress, arbiterAddress);
+  }
   /**
    * POST /api/v1/shipments/:id/arbiter/decline
    */
@@ -632,73 +783,16 @@ export class ShipmentsController {
   }
 
   /**
-   * POST /api/v1/shipments/:id/clone
-   * Copies a shipment's structure into a new ACTIVE shipment with a fresh ID and reset milestones.
-   * Restricted to the original shipment's buyerAddress.
+   * GET /api/v1/shipments/:id/refund
+   * Returns refund details for a cancelled shipment.
    */
-  @Post(':id/clone')
-  @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Clone a shipment into a new active shipment (buyer only)' })
-  @ApiResponse({ status: 201, description: 'Cloned shipment created' })
-  @ApiResponse({ status: 403, description: 'Only the original buyer can clone' })
-  @ApiResponse({ status: 404, description: 'Source shipment not found' })
-  clone(@Param('id') id: string, @Body() dto: CloneShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.clone(id, user.stellarAddress, dto);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/cancel
-   * Buyer registers the on-chain cancellation tx hash, transitioning the shipment to CANCELLED.
-   */
-  @Post(':id/cancel')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Cancel a shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment cancelled' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can cancel' })
-  @ApiResponse({ status: 409, description: 'Shipment is not ACTIVE' })
-  cancel(@Param('id') id: string, @Body() dto: CancelShipmentDto, @CurrentUser() user: any) {
-    return this.shipmentsService.cancel(id, user.stellarAddress, dto.txHash);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/archive
-   * Archive a completed/cancelled shipment to hide it from default listings (buyer only).
-   */
-  @Post(':id/archive')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Archive a completed/cancelled shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment archived' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can archive' })
-  @ApiResponse({ status: 409, description: 'Only COMPLETED or CANCELLED shipments can be archived' })
-  archive(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.archive(id, user.stellarAddress);
-  }
-
-  /**
-   * POST /api/v1/shipments/:id/unarchive
-   * Restore an archived shipment to the default listing (buyer only).
-   */
-  @Post(':id/unarchive')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Unarchive a shipment (buyer only)' })
-  @ApiResponse({ status: 200, description: 'Shipment unarchived' })
-  @ApiResponse({ status: 403, description: 'Only the buyer can unarchive' })
-  @ApiResponse({ status: 409, description: 'Shipment is not archived' })
-  unarchive(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.unarchive(id, user.stellarAddress);
-  }
-
-  /**
-   * GET /api/v1/shipments/:id/my-role
-   * Return the caller's participant role without exposing full shipment data.
-   * Non-participants receive { role: null } with 200 instead of 403.
-   */
-  @Get(':id/my-role')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: "Get the caller's participant role for a shipment" })
-  @ApiResponse({ status: 200, description: "Role: BUYER | SUPPLIER | LOGISTICS | ARBITER | ADMIN | null" })
-  myRole(@Param('id') id: string, @CurrentUser() user: any) {
-    return this.shipmentsService.getCallerRole(id, user.stellarAddress, user.role === UserRole.ADMIN);
+  @Get(':id/refund')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get refund details for a cancelled shipment' })
+  @ApiResponse({ status: 200, description: 'Refund details' })
+  @ApiResponse({ status: 404, description: 'Shipment not found or not cancelled' })
+  getRefund(@Param('id') id: string) {
+    return this.shipmentsService.getRefundDetail(id);
   }
 
   /**

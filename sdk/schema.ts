@@ -168,8 +168,93 @@ export interface paths {
       };
     };
   };
+  '/api/v1/admin/users/{id}/force-logout': {
+    post: {
+      parameters: {
+        path: { id: string };
+      };
+      requestBody?: {
+        content: {
+          'application/json': {
+            revokeApiKeys?: boolean;
+          };
+        };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              success?: boolean;
+              data?: {
+                message?: string;
+                revokedSessionsCount?: number;
+                revokedApiKeysCount?: number;
+              };
+            };
+          };
+        };
+      };
+    };
+  };
   '/api/v1/users/me': {
     get: {
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              success?: boolean;
+              data?: unknown;
+              timestamp?: string;
+            };
+          };
+        };
+      };
+    };
+  };
+  '/api/v1/users/me/avatar': {
+    put: {
+      requestBody: {
+        content: {
+          'multipart/form-data': {
+            file: string;
+          };
+        };
+      };
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              success?: boolean;
+              data?: {
+                message?: string;
+                avatarCid?: string;
+                avatarUrl?: string;
+              };
+            };
+          };
+        };
+      };
+    };
+    delete: {
+      responses: {
+        200: {
+          content: {
+            'application/json': {
+              success?: boolean;
+              data?: {
+                message?: string;
+              };
+            };
+          };
+        };
+      };
+    };
+  };
+  '/api/v1/users/{stellarAddress}': {
+    get: {
+      parameters: {
+        path: { stellarAddress: string };
+      };
       responses: {
         200: {
           content: {

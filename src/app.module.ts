@@ -21,6 +21,7 @@ import { FxModule } from './common/fx/fx.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ShipmentsModule } from './modules/shipments/shipments.module';
 import { ShipmentTemplatesModule } from './modules/shipment-templates/shipment-templates.module';
+import { RecurringSchedulesModule } from './modules/recurring-schedules/recurring-schedules.module';
 import { MilestonesModule } from './modules/milestones/milestones.module';
 import { EventsModule } from './modules/events/events.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
@@ -34,6 +35,10 @@ import { KycModule } from './modules/kyc/kyc.module';
 import { ArbitersModule } from './modules/arbiters/arbiters.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
 import { InvitationsModule } from './modules/invitations/invitations.module';
+import { GraphqlModule } from './modules/graphql/graphql.module';
+import { AdminDashboardModule } from './modules/admin-dashboard/admin-dashboard.module';
+import { AdminDisputesModule } from './modules/admin-dashboard/admin-disputes.module';
+import { SettlementProposalsModule } from './modules/milestones/settlement-proposals.module';
 
 @Module({
   imports: [
@@ -80,6 +85,7 @@ import { InvitationsModule } from './modules/invitations/invitations.module';
     AuthModule,
     ShipmentsModule,
     ShipmentTemplatesModule,
+    RecurringSchedulesModule,
     MilestonesModule,
     EventsModule,
     NotificationsModule,
@@ -91,6 +97,10 @@ import { InvitationsModule } from './modules/invitations/invitations.module';
     ArbitersModule,
     InvitationsModule,
     FeatureFlagsModule,
+    GraphqlModule,
+    AdminDashboardModule,
+    AdminDisputesModule,
+    SettlementProposalsModule,
   ],
   providers: [
     // Apply global throttler guard (sets X-RateLimit-* on success and 429)

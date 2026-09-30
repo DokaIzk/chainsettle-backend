@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Networks,
@@ -11,6 +11,7 @@ import {
   nativeToScVal,
   scValToNative,
   xdr,
+  StrKey,
 } from '@stellar/stellar-sdk';
 import { SpanKind } from '@opentelemetry/api';
 import { withSpan } from '../tracing/trace.helper';
@@ -308,6 +309,60 @@ export class StellarService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
+   * Probes the Soroban RPC retention window by binary-searching for the oldest
+   * ledger that `getEvents` can still serve.
+   *
+   * Strategy: the Stellar RPC rejects `getEvents` calls whose `startLedger`
+   * is older than the node's history window with an error containing the phrase
+   * "startLedger". We binary-search between 1 and (latestLedger - 1) to find
+   * the actual retention floor.  A simpler heuristic is used as the lower bound
+   * so the search converges quickly (~7 iterations for a 17-day / ~1.5 M ledger
+   * window at 5 s/ledger).
+   *
+   * Returns the lowest ledger number the RPC can still serve, or 1 on failure.
+   */
+  async getOldestAvailableLedger(): Promise<number> {
+    let latest: number;
+    try {
+      latest = await this.getLatestLedger();
+    } catch {
+      return 1;
+    }
+
+    // A Soroban RPC node typically retains ~17 days ≈ ~288 000 ledgers.
+    // Start the binary search a little beyond that as the lower bound.
+    let lo = Math.max(1, latest - 400_000);
+    let hi = latest - 1;
+    let oldest = latest;
+
+    while (lo <= hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      try {
+        await this.rpcClient.getEvents({
+          startLedger: mid,
+          filters: [],
+          limit: 1,
+        });
+        // RPC accepted this ledger → try going even further back
+        oldest = mid;
+        hi = mid - 1;
+      } catch (err) {
+        const msg: string = (err as Error).message ?? '';
+        if (msg.toLowerCase().includes('startledger') || msg.toLowerCase().includes('not found')) {
+          // Too old — move the lower bound up
+          lo = mid + 1;
+        } else {
+          // Unexpected RPC error — bail out conservatively
+          this.logger.warn(`getOldestAvailableLedger probe error at ${mid}: ${msg}`);
+          break;
+        }
+      }
+    }
+
+    return oldest;
+  }
+
+  /**
    * Fetches metadata for a specific ledger sequence number via the Stellar RPC.
    * Returns { sequence, closedAt, txCount, baseFee } or null if not found.
    */
@@ -482,5 +537,195 @@ export class StellarService implements OnModuleInit, OnModuleDestroy {
     return () => {
       active = false;
     };
+  }
+
+  // ----------------------------------------------------------
+  // TRANSACTION STATUS LOOKUP
+  // ----------------------------------------------------------
+
+  /**
+   * Fetches the status and metadata of a submitted Stellar transaction
+   * directly from the Soroban RPC.
+   *
+   * Possible status values returned by the RPC:
+   *  - SUCCESS    — transaction was included in a ledger and succeeded
+   *  - FAILED     — transaction was included but its operation(s) failed
+   *  - NOT_FOUND  — hash is unknown; may still be in the mempool (PENDING) or invalid
+   *
+   * The caller maps NOT_FOUND to a PENDING/NOT_FOUND distinction.
+   * This method never throws for known statuses — it always returns a typed object.
+   *
+   * @param txHash  64-character hex transaction hash
+   */
+  async getTransaction(txHash: string): Promise<{
+    hash: string;
+    status: 'SUCCESS' | 'FAILED' | 'PENDING' | 'NOT_FOUND';
+    ledger: number | null;
+    createdAt: string | null;
+    feeCharged: string | null;
+    resultCode: string | null;
+    envelopeXdr: string | null;
+    resultXdr: string | null;
+    events: any[];
+  }> {
+    return withSpan(
+      'stellar.getTransaction',
+      async (span) => {
+        span.setAttribute('stellar.tx_hash', txHash);
+
+        try {
+          const tx = await this.rpcClient.getTransaction(txHash);
+          span.setAttribute('stellar.tx_status', tx.status);
+
+          if (tx.status === 'NOT_FOUND') {
+            return {
+              hash: txHash,
+              status: 'NOT_FOUND' as const,
+              ledger: null,
+              createdAt: null,
+              feeCharged: null,
+              resultCode: null,
+              envelopeXdr: null,
+              resultXdr: null,
+              events: [],
+            };
+          }
+
+          // Extract result code from resultXdr when available
+          let resultCode: string | null = null;
+          if (tx.resultXdr) {
+            try {
+              const result = (tx.resultXdr as any).result?.();
+              resultCode = result?.switch?.().name ?? null;
+            } catch {
+              // resultXdr may not be a parsed XDR object in all SDK versions
+              resultCode = null;
+            }
+          }
+
+          // Extract fee from envelopeXdr when available
+          let feeCharged: string | null = null;
+          if (tx.envelopeXdr) {
+            try {
+              const fee = (tx.envelopeXdr as any).tx?.().fee?.();
+              feeCharged = fee != null ? String(fee) : null;
+            } catch {
+              feeCharged = null;
+            }
+          }
+
+          // Decode createdAt from ledger close time when available
+          const createdAt: string | null =
+            (tx as any).createdAt
+              ? new Date((tx as any).createdAt * 1000).toISOString()
+              : null;
+
+          // Decode contract events on success
+          let events: any[] = [];
+          if (tx.status === 'SUCCESS') {
+            try {
+              events = await this.getTransactionEvents(txHash);
+            } catch {
+              // Non-fatal — event decoding failure should not block the status response
+              events = [];
+            }
+          }
+
+          return {
+            hash: txHash,
+            status: tx.status as 'SUCCESS' | 'FAILED',
+            ledger: tx.ledger ?? null,
+            createdAt,
+            feeCharged,
+            resultCode,
+            envelopeXdr: tx.envelopeXdr ? String(tx.envelopeXdr) : null,
+            resultXdr: tx.resultXdr ? String(tx.resultXdr) : null,
+            events,
+          };
+        } catch (error) {
+          this.logger.error(`getTransaction(${txHash}) failed: ${error.message}`);
+          throw error;
+        }
+      },
+      { 'stellar.rpc_url': this.rpcPool.activeUrl },
+      SpanKind.CLIENT,
+    );
+  }
+
+  /**
+   * Fetches the transaction's result meta from Soroban RPC and decodes
+   * any events emitted by our contract.
+   * Throws NotFoundException if the transaction is not found.
+   */
+  async getTransactionEvents(txHash: string): Promise<any[]> {
+    return withSpan(
+      'stellar.getTransactionEvents',
+      async (span) => {
+        span.setAttribute('stellar.tx_hash', txHash);
+        try {
+          const tx = await this.rpcClient.getTransaction(txHash);
+          if (tx.status === 'NOT_FOUND') {
+            throw new NotFoundException(`Transaction ${txHash} not found`);
+          }
+          if (tx.status !== 'SUCCESS') {
+            return [];
+          }
+          if (!tx.resultMetaXdr) {
+            return [];
+          }
+
+          const meta = tx.resultMetaXdr as any;
+          
+          let sorobanMeta: any;
+          if (meta.switch && meta.switch() === 3) {
+            sorobanMeta = meta.v3().sorobanMeta();
+          } else {
+            try {
+              sorobanMeta = meta.sorobanMeta();
+            } catch {}
+          }
+
+          if (!sorobanMeta) {
+            return [];
+          }
+
+          const events = sorobanMeta.events() ?? [];
+          const decodedEvents = [];
+
+          for (const e of events) {
+            const contractIdBuf = e.contractId();
+            if (!contractIdBuf) continue;
+
+            const contractAddress = StrKey.encodeContract(contractIdBuf);
+            if (contractAddress !== this.contractId) continue;
+
+            if (e.type().name !== 'contract' && e.type().value !== 0) continue;
+
+            const topics = e.body().v0().topics().map((t: any) => scValToNative(t));
+            const value = scValToNative(e.body().v0().data());
+
+            decodedEvents.push({
+              id: `${txHash}-${decodedEvents.length}`,
+              contractId: contractAddress,
+              type: 'contract',
+              topic: topics,
+              value: value,
+              ledger: tx.ledger,
+              txHash: txHash,
+            });
+          }
+
+          return decodedEvents;
+        } catch (error) {
+          if (error instanceof NotFoundException) {
+            throw error;
+          }
+          this.logger.error(`getTransactionEvents(${txHash}) failed: ${error.message}`);
+          throw error;
+        }
+      },
+      { 'stellar.rpc_url': this.rpcPool.activeUrl },
+      SpanKind.CLIENT,
+    );
   }
 }

@@ -34,6 +34,7 @@ import { MilestonesService } from './milestones.service';
 import { AppendMilestoneDto } from './dto/append-milestone.dto';
 import { ConfirmMilestoneDto } from './dto/confirm-milestone.dto';
 import { BulkConfirmMilestonesDto } from './dto/bulk-confirm-milestones.dto';
+import { BulkRejectMilestonesDto } from './dto/bulk-reject-milestones.dto';
 import { RebalanceMilestonesDto } from './dto/rebalance-milestones.dto';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
@@ -96,6 +97,7 @@ export class MilestonesController {
   @ApiOperation({ summary: 'List all milestones for a shipment with optional filters' })
   @ApiQuery({ name: 'status', required: false, enum: ['PENDING', 'PROOF_SUBMITTED', 'CONFIRMED', 'DISPUTED', 'RESOLVED'] })
   @ApiQuery({ name: 'overdue', required: false, type: Boolean })
+  @ApiQuery({ name: 'precision', required: false, type: Number, description: 'Override decimal places for FX-converted values (e.g. 0 for JPY, 2 for USD, 4 for KWD). Defaults to currency-appropriate value.' })
   @ApiResponse({ status: 200, description: 'List of milestones with isOverdue computed' })
   @ApiResponse({ status: 403, description: 'Not a shipment participant' })
   @ApiResponse({ status: 404, description: 'Shipment not found' })
@@ -103,9 +105,11 @@ export class MilestonesController {
     @Param('shipmentId') shipmentId: string,
     @Query('status') status?: string,
     @Query('overdue') overdue?: string,
+    @Query('precision') precision?: string,
   ) {
     const isOverdueFilter = overdue === 'true';
-    return this.milestonesService.findByShipment(shipmentId, status, isOverdueFilter);
+    const precisionOverride = precision !== undefined ? parseInt(precision, 10) : undefined;
+    return this.milestonesService.findByShipment(shipmentId, status, isOverdueFilter, precisionOverride);
   }
 
   /**
@@ -153,7 +157,20 @@ export class MilestonesController {
     @Param('shipmentId') shipmentId: string,
     @Param('index', ParseIntPipe) index: number,
   ) {
-    return this.milestonesService.findOne(shipmentId, index);
+    return this.milestonesService.findOneWithCommentCount(shipmentId, index);
+  }
+
+  @Get(':index/reminders')
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Get reminder history for a milestone' })
+  @ApiResponse({ status: 200, description: 'Reminder history records for this milestone' })
+  @ApiResponse({ status: 403, description: 'Not a shipment participant' })
+  @ApiResponse({ status: 404, description: 'Milestone or shipment not found' })
+  getReminderHistory(
+    @Param('shipmentId') shipmentId: string,
+    @Param('index', ParseIntPipe) index: number,
+  ) {
+    return this.milestonesService.getReminderHistory(shipmentId, index);
   }
 
   /**
@@ -255,6 +272,43 @@ export class MilestonesController {
   }
 
   /**
+   * POST /api/v1/shipments/:shipmentId/milestones/:index/proof/verify
+   *
+   * Hashes the uploaded file with SHA-256 and reports whether it matches a
+   * stored proof submission for this milestone (#394).
+   */
+  @Post(':index/proof/verify')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Check whether a file matches a stored milestone proof (SHA-256)' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['file'],
+      properties: { file: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({ status: 200, description: '{ matches, submissionId?, sha256 }' })
+  @ApiResponse({ status: 400, description: 'No file uploaded' })
+  @ApiResponse({ status: 404, description: 'Milestone not found' })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: MAX_FILE_SIZE },
+    }),
+  )
+  verifyProof(
+    @Param('shipmentId') shipmentId: string,
+    @Param('index', ParseIntPipe) index: number,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) {
+      throw new BadRequestException('A file must be provided in the "file" field');
+    }
+    return this.milestonesService.verifyProof(shipmentId, index, file);
+  }
+
+  /**
    * POST /api/v1/shipments/:shipmentId/milestones/rebalance
    *
    * Atomically redistributes payment percentages across PENDING milestones.
@@ -303,6 +357,29 @@ export class MilestonesController {
       dto.txHash,
       dto.paymentReleased,
     );
+  }
+
+  /**
+   * POST /api/v1/shipments/:shipmentId/milestones/bulk-reject
+   * Batch-reject multiple submitted proofs in one request (buyer only).
+   * Validates each index independently and returns a per-index result so
+   * partial failures (e.g. one milestone not in PROOF_SUBMITTED) don't fail
+   * the whole batch.
+   */
+  @Post('bulk-reject')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(ShipmentParticipantGuard)
+  @ApiOperation({ summary: 'Batch-reject multiple submitted proofs (buyer only)' })
+  @ApiResponse({ status: 200, description: 'Per-index results for the batch' })
+  @ApiResponse({ status: 403, description: 'Only the buyer may reject proofs' })
+  @ApiResponse({ status: 404, description: 'Shipment not found' })
+  bulkReject(
+    @Param('shipmentId') shipmentId: string,
+    @Body() dto: BulkRejectMilestonesDto,
+    @CurrentUser() user: any,
+  ) {
+    const callerAddress: string = user?.stellarAddress ?? user?.sub;
+    return this.milestonesService.bulkRejectFromApi(shipmentId, callerAddress, dto.indices, dto.reason);
   }
 
   /**

@@ -1,16 +1,28 @@
-import { Injectable, UnauthorizedException, ConflictException, Logger, BadRequestException, NotFoundException, ForbiddenException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+  Logger,
+  BadRequestException,
+  NotFoundException,
+  ForbiddenException,
+  PayloadTooLargeException,
+  Optional,
+} from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
 import { ConfigService } from '@nestjs/config';
+import { randomUUID } from 'crypto';
 import { Keypair } from '@stellar/stellar-sdk';
 import { UserRole, ShipmentStatus } from '@prisma/client';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
+import { IpfsService } from '../../common/ipfs/ipfs.service';
 import { LoginDto } from './dto/login.dto';
 import { UpdateProfileDto } from './dto/update-profile.dto';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditLogService } from '../audit-logs/audit-log.service';
-
-
+import { SessionService } from './session.service';
+import { ForceLogoutDto } from './dto/force-logout.dto';
 
 /**
  * AuthService
@@ -32,7 +44,9 @@ export class AuthService {
   private readonly NONCE_PREFIX = 'chainsettle:nonce:';
   private readonly NONCE_TTL_MS = 5 * 60 * 1000; // 5 minutes in milliseconds
   private readonly EMAIL_VERIFICATION_TOKEN_PREFIX = 'chainsettle:email-verification-token:';
-
+  private readonly PHONE_OTP_PREFIX = 'chainsettle:phone-otp:';
+  private readonly PHONE_OTP_TTL_MS = 5 * 60 * 1000; // 5 minutes for OTP
+  private readonly PHONE_OTP_LENGTH = 6;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -41,7 +55,9 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly notifications: NotificationsService,
     private readonly auditLog: AuditLogService,
-  ) { }
+    private readonly sessions: SessionService,
+    @Optional() private readonly ipfs?: IpfsService,
+  ) {}
 
   // ----------------------------------------------------------
   // STEP 1: Generate a challenge nonce for an address
@@ -62,7 +78,11 @@ export class AuthService {
   // STEP 2: Verify signed nonce and issue JWT
   // ----------------------------------------------------------
 
-  async login(dto: LoginDto): Promise<{ accessToken: string; user: any }> {
+  async login(
+    dto: LoginDto,
+    userAgent = 'unknown',
+    ipAddress = 'unknown',
+  ): Promise<{ accessToken: string; user: any }> {
     const { stellarAddress, signedNonce, signature } = dto;
 
     // Retrieve the stored nonce from Redis
@@ -99,16 +119,17 @@ export class AuthService {
       update: { updatedAt: new Date() },
     });
 
-    if (user.deactivatedAt) {
-      throw new UnauthorizedException('Account has been deactivated');
-    }
-
-    // Sign JWT
+    // Sign JWT — embed a unique jti so this session can be individually revoked
+    const jti = randomUUID();
     const accessToken = this.jwt.sign({
       sub: user.id,
       stellarAddress: user.stellarAddress,
       role: user.role,
+      jti,
     });
+
+    // Track this session in Redis so revoke-all can enumerate it
+    await this.sessions.registerSession(user.id, jti);
 
     this.logger.log(`User authenticated: ${stellarAddress}`);
     return { accessToken, user };
@@ -123,6 +144,8 @@ export class AuthService {
         name: true,
         email: true,
         role: true,
+        displayCurrency: true,
+        avatarCid: true,
         deactivatedAt: true,
         createdAt: true,
       },
@@ -137,7 +160,47 @@ export class AuthService {
     }
 
     const { deactivatedAt: _deactivatedAt, ...profile } = user;
-    return profile;
+    return {
+      ...profile,
+      avatarUrl: profile.avatarCid ? `/api/v1/ipfs/${profile.avatarCid}` : null,
+    };
+  }
+
+  /**
+   * Invalidate the current session so the token is immediately rejected.
+   * `jti` is the sessionId embedded in the JWT at login time.
+   * `exp` is the JWT expiry epoch (seconds) so we can compute remaining TTL.
+   */
+  async logout(userId: string, jti: string, exp: number): Promise<{ message: string }> {
+    const nowMs = Date.now();
+    const expiryMs = exp * 1000;
+    const remainingMs = Math.max(0, expiryMs - nowMs);
+
+    await this.sessions.invalidateSession(userId, jti, remainingMs);
+    return { message: 'Logged out successfully' };
+  }
+
+  /**
+   * Return all active sessions for the authenticated user.
+   * Raw token values are never returned — only opaque metadata.
+   */
+  async getSessions(userId: string) {
+    return this.sessions.listSessions(userId);
+  }
+
+  /**
+   * Revoke a single active session owned by the authenticated user.
+   * The session record is deleted and its JWT is added to the blocklist
+   * so future requests with that token are rejected.
+   */
+  async revokeSession(userId: string, sessionId: string): Promise<{ message: string }> {
+    const revoked = await this.sessions.revokeSession(userId, sessionId);
+
+    if (!revoked) {
+      throw new NotFoundException('Session not found');
+    }
+
+    return { message: 'Session revoked successfully' };
   }
 
   /**
@@ -278,6 +341,8 @@ export class AuthService {
         pendingEmail: true,
         name: true,
         role: true,
+        organizationName: true,
+        countryCode: true,
         deactivatedAt: true,
         createdAt: true,
         updatedAt: true,
@@ -329,6 +394,8 @@ export class AuthService {
         emailVerified: true,
         name: true,
         role: true,
+        organizationName: true,
+        countryCode: true,
         kycStatus: true,
         createdAt: true,
         updatedAt: true,
@@ -397,10 +464,87 @@ export class AuthService {
   async getPublicProfile(stellarAddress: string) {
     const user = await this.prisma.user.findUnique({
       where: { stellarAddress },
-      select: { stellarAddress: true, name: true, role: true, createdAt: true },
+      select: { stellarAddress: true, name: true, role: true, organizationName: true, countryCode: true, createdAt: true },
     });
     if (!user) throw new NotFoundException('User not found');
-    return user;
+    return {
+      ...user,
+      avatarUrl: user.avatarCid ? `/api/v1/ipfs/${user.avatarCid}` : null,
+    };
+  }
+
+  /**
+   * Uploads an avatar image to IPFS and attaches the CID to the user profile.
+   * Enforces 2 MB limit and allowed image MIME types (png, jpeg, webp).
+   */
+  async uploadAvatar(
+    userId: string,
+    file: Express.Multer.File,
+  ): Promise<{
+    message: string;
+    avatarCid: string;
+    avatarUrl: string;
+  }> {
+    if (!file) {
+      throw new BadRequestException('Avatar image file is required');
+    }
+
+    const allowedMimeTypes = ['image/png', 'image/jpeg', 'image/webp'];
+    if (!allowedMimeTypes.includes(file.mimetype)) {
+      throw new BadRequestException(
+        `Invalid file type: ${file.mimetype}. Allowed types: ${allowedMimeTypes.join(', ')}`,
+      );
+    }
+
+    const maxSizeBytes = 2 * 1024 * 1024; // 2 MB
+    const fileSize = file.size ?? file.buffer?.length ?? 0;
+    if (fileSize > maxSizeBytes) {
+      throw new PayloadTooLargeException('Avatar image must not exceed 2 MB');
+    }
+
+    if (!this.ipfs) {
+      throw new BadRequestException('IPFS service is not available');
+    }
+
+    const cid = await this.ipfs.uploadFile(
+      file.buffer,
+      file.originalname || 'avatar',
+      file.mimetype,
+    );
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { avatarCid: cid },
+    });
+
+    const avatarUrl = `/api/v1/ipfs/${cid}`;
+
+    return {
+      message: 'Avatar uploaded successfully',
+      avatarCid: cid,
+      avatarUrl,
+    };
+  }
+
+  /**
+   * Clears the avatar CID for the user.
+   */
+  async deleteAvatar(userId: string): Promise<{ message: string }> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, avatarCid: true },
+    });
+
+    if (!user) {
+      throw new NotFoundException('User not found');
+    }
+
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: { avatarCid: null },
+    });
+
+    return { message: 'Avatar deleted successfully' };
   }
 
   /**
@@ -489,6 +633,106 @@ export class AuthService {
     };
   }
 
+  /**
+   * Force logout a user by immediately revoking all their active JWT sessions
+   * and optionally revoking all their active API keys.
+   *
+   * Admin-only tool for security incident response (e.g. account takeover).
+   */
+  async forceLogoutUser(
+    targetUserId: string,
+    adminId: string,
+    adminAddress: string,
+    dto?: ForceLogoutDto,
+    ipAddress?: string,
+  ): Promise<{
+    message: string;
+    revokedSessionsCount: number;
+    revokedApiKeysCount: number;
+  }> {
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetUserId },
+      select: {
+        id: true,
+        stellarAddress: true,
+      },
+    });
+
+    if (!target) {
+      throw new NotFoundException('User not found');
+    }
+
+    const revokeApiKeys = dto?.revokeApiKeys ?? false;
+
+    // 1. Revoke all active sessions via SessionService
+    // includeCurrent: true ensures every active session for the target user is blocklisted
+    const revokedSessionsCount = await this.sessions.revokeAllSessions(
+      target.id,
+      '',
+      true,
+    );
+
+    // 2. Optionally revoke all active API keys
+    let revokedApiKeysCount = 0;
+    if (revokeApiKeys) {
+      const result = await this.prisma.apiKey.updateMany({
+        where: {
+          userId: target.id,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: new Date(),
+          gracePeriodEndsAt: null,
+        },
+      });
+      revokedApiKeysCount = result.count;
+    }
+
+    // 3. Record an audit log entry with the admin as actor
+    await this.auditLog.record({
+      actorId: adminId,
+      actorAddress: adminAddress,
+      action: 'ADMIN_FORCE_LOGOUT',
+      resourceType: 'User',
+      resourceId: target.id,
+      metadata: {
+        targetUserId: target.id,
+        targetStellarAddress: target.stellarAddress,
+        revokedSessionsCount,
+        revokedApiKeysCount,
+        revokeApiKeys,
+      },
+      ipAddress,
+    });
+
+    this.logger.warn(
+      `Admin ${adminId} (${adminAddress}) force-logged out user ${target.id} (${target.stellarAddress}). ` +
+        `Revoked ${revokedSessionsCount} session(s) and ${revokedApiKeysCount} API key(s).`,
+    );
+
+    return {
+      message: 'User force-logged out successfully',
+      revokedSessionsCount,
+      revokedApiKeysCount,
+    };
+  }
+
+  /**
+   * Returns the stored displayCurrency preference for a user.
+   * Falls back to 'USD' for unknown users or DB errors — never throws.
+   */
+  async getUserDisplayCurrency(userId: string): Promise<string> {
+    try {
+      const user = await this.prisma.user.findUnique({
+        where: { id: userId },
+        select: { displayCurrency: true },
+      });
+      return user?.displayCurrency ?? 'USD';
+    } catch {
+      return 'USD';
+    }
+  }
+
   async updateProfile(userId: string, dto: UpdateProfileDto) {
     const user = await this.prisma.user.findUnique({ where: { id: userId } });
 
@@ -500,6 +744,10 @@ export class AuthService {
 
     if (dto.name !== undefined) {
       updateData.name = dto.name;
+    }
+
+    if (dto.displayCurrency !== undefined) {
+      updateData.displayCurrency = dto.displayCurrency.toUpperCase();
     }
 
     if (dto.email !== undefined && dto.email !== user.email) {
@@ -681,5 +929,91 @@ export class AuthService {
     );
 
     return { message: 'Verification email sent' };
+  }
+
+  // ----------------------------------------------------------
+  // Phone verification
+  // ----------------------------------------------------------
+
+  /**
+   * Initiate phone number verification by sending an OTP.
+   * Stores the pending phone and OTP in Redis.
+   */
+  async sendPhoneVerificationOtp(userId: string, phoneNumber: string): Promise<{ message: string }> {
+    // Check if phone is already verified
+    const existingUser = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { phoneNumber: true, phoneVerified: true },
+    });
+
+    if (existingUser?.phoneVerified && existingUser?.phoneNumber === phoneNumber) {
+      throw new BadRequestException('Phone number is already verified');
+    }
+
+    // Generate OTP
+    const otp = this.generateOtp();
+    const key = `${this.PHONE_OTP_PREFIX}${userId}`;
+
+    // Store OTP in Redis with 5-minute TTL
+    await this.redis.setPx(key, otp, this.PHONE_OTP_TTL_MS);
+
+    // Store pending phone number (overwrites any previous pending)
+    const pendingKey = `${this.PHONE_OTP_PREFIX}${userId}:pending`;
+    await this.redis.setPx(pendingKey, phoneNumber, this.PHONE_OTP_TTL_MS);
+
+    // TODO: Actually send SMS via SMS provider when implemented
+    // For now, log the OTP for development
+    this.logger.log(`Phone verification OTP for ${userId}: ${otp}`);
+
+    return { message: 'Verification code sent to your phone' };
+  }
+
+  /**
+   * Verify phone number with OTP.
+   * If OTP is valid, updates user's phoneNumber and sets phoneVerified to true.
+   */
+  async verifyPhone(userId: string, otp: string): Promise<{ message: string; phoneNumber: string }> {
+    const key = `${this.PHONE_OTP_PREFIX}${userId}`;
+    const pendingKey = `${this.PHONE_OTP_PREFIX}${userId}:pending`;
+
+    const storedOtp = await this.redis.get(key);
+    const pendingPhone = await this.redis.get(pendingKey);
+
+    if (!storedOtp || storedOtp !== otp) {
+      throw new UnauthorizedException('Invalid or expired verification code');
+    }
+
+    if (!pendingPhone) {
+      throw new BadRequestException('No pending phone verification. Request a new code.');
+    }
+
+    // Clear the OTP and pending phone
+    await this.redis.del(key);
+    await this.redis.del(pendingKey);
+
+    // Update user's phone
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        phoneNumber: pendingPhone,
+        phoneVerified: true,
+        pendingPhone: null,
+      },
+    });
+
+    this.logger.log(`Phone verified for user ${userId}: ${pendingPhone}`);
+
+    return { message: 'Phone number verified successfully', phoneNumber: pendingPhone };
+  }
+
+  /**
+   * Generate a numeric OTP of configured length.
+   */
+  private generateOtp(): string {
+    let otp = '';
+    for (let i = 0; i < this.PHONE_OTP_LENGTH; i++) {
+      otp += Math.floor(Math.random() * 10).toString();
+    }
+    return otp;
   }
 }

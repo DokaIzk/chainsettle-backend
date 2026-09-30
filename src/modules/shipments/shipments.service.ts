@@ -6,6 +6,7 @@ import {
   ForbiddenException,
   BadRequestException,
   InternalServerErrorException,
+  PreconditionFailedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { createHash } from 'crypto';
@@ -21,12 +22,37 @@ import { ShipmentApprovalsService } from './shipment-approvals.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
 import { CreateShipmentDto, CloneShipmentDto } from './dto/create-shipment.dto';
 import { CreateTrackingDto } from './dto/tracking.dto';
-import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
+import { ShipmentDocumentDto } from './dto/shipment-document.dto';
+import { ShipmentStatus, NotificationType, ArbiterStatus, CommentVisibility } from '@prisma/client';
 import { nativeToScVal } from '@stellar/stellar-sdk';
 import { randomUUID } from 'crypto';
 import { parse } from 'csv-parse/sync';
 import Ajv from 'ajv';
 import { metadataSchemas } from './schemas/metadata.schemas';
+import { pickFields } from './shipment-fields';
+
+const DUPLICATE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Strong ETag for a shipment's mutable state (#387). Derived from id and
+ * updatedAt so every successful write produces a new value.
+ */
+export function shipmentEtag(shipment: { id: string; updatedAt: Date }): string {
+  const hash = createHash('sha1')
+    .update(`${shipment.id}:${new Date(shipment.updatedAt).toISOString()}`)
+    .digest('hex');
+  return `"${hash}"`;
+}
+
+/** True when an If-Match header value matches the current ETag (or is `*`). */
+export function ifMatchSatisfied(ifMatch: string, currentEtag: string): boolean {
+  return ifMatch
+    .split(',')
+    .map((v) => v.trim().replace(/^W\//, ''))
+    .some((v) => v === '*' || v === currentEtag);
+}
+
+import { computeFieldChanges, extractChanges, isHiddenField } from './shipment-diff.util';
 
 @Injectable()
 export class ShipmentsService {
@@ -81,8 +107,8 @@ export class ShipmentsService {
     // Pre-populate from template if provided
     let templateData: any = {};
     if (dto.templateId) {
-      const template = await this.prisma.shipmentTemplate.findUnique({
-        where: { id: dto.templateId },
+      const template = await this.prisma.shipmentTemplate.findFirst({
+        where: { id: dto.templateId, deletedAt: null },
       });
       if (!template) {
         throw new NotFoundException(`Template ${dto.templateId} not found`);
@@ -103,7 +129,9 @@ export class ShipmentsService {
     const tokenAddress = dto.tokenAddress ?? templateData.tokenAddress;
     const milestones = dto.milestones ?? templateData.milestones;
 
-    // Validate required fields
+    if (arbiterAddress && [dto.buyerAddress, supplierAddress, logisticsAddress].some(a => a && a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+
+        // Validate required fields
     if (!supplierAddress || !logisticsAddress || !arbiterAddress || !tokenAddress || !milestones) {
       throw new ConflictException(
         'Missing required fields: supplierAddress, logisticsAddress, arbiterAddress, tokenAddress, milestones',
@@ -143,6 +171,12 @@ export class ShipmentsService {
     }
 
     const token = this.tokenRegistry.getToken(tokenAddress);
+    if (!token.enabled) {
+      throw new BadRequestException(`Token ${tokenAddress} is disabled and cannot be used for new shipments`);
+    }
+
+    // Per-token min/max shipment value (#304) — no-op for tokens without bounds.
+    this.tokenRegistry.assertValueWithinBounds(tokenAddress, totalAmountBigInt);
 
     // Multi-signature approval gate (#234). Rejects the field outright on
     // shipments below the configured value threshold rather than dropping it
@@ -169,6 +203,7 @@ export class ShipmentsService {
         referenceNumber: dto.referenceNumber,
         metadata: dto.metadata,
         tags: dto.tags ?? [],
+        expectedDeliveryAt: dto.expectedDeliveryAt ? new Date(dto.expectedDeliveryAt) : null,
         milestones: {
           create: milestones.map((m: any, index: number) => ({
             milestoneIndex: index,
@@ -176,6 +211,17 @@ export class ShipmentsService {
             paymentPercent: m.paymentPercent,
             ...(m.dueAt ? { dueAt: new Date(m.dueAt) } : {}),
             ...(m.dueDays ? { dueAt: new Date(Date.now() + m.dueDays * 24 * 60 * 60 * 1000) } : {}),
+            // Template checklists (#392) become real checklist items.
+            ...(Array.isArray(m.checklist) && m.checklist.length > 0
+              ? {
+                  checklistItems: {
+                    create: m.checklist.map((c: any) => ({
+                      label: String(c.label),
+                      required: c.required ?? true,
+                    })),
+                  },
+                }
+              : {}),
           })),
         },
       },
@@ -195,7 +241,7 @@ export class ShipmentsService {
     this.metrics.incrementShipmentsCreated();
     this.metrics.incrementActiveShipments();
     await this.invalidateUserCache(dto.buyerAddress);
-    return await this.serialize(shipment);
+    return { ...(await this.serialize(shipment)), warnings: await this.getArbiterWarnings(arbiterAddress, dto.buyerAddress, supplierAddress) };
   }
 
   // ----------------------------------------------------------
@@ -222,6 +268,10 @@ export class ShipmentsService {
     isDraft?: boolean;
     favorite?: boolean;
     callerUserId?: string;
+    /** Sparse fieldset (#390), already validated by parseFields(). */
+    fields?: string[];
+    /** ISO-4217 display currency for FX-converted values. Defaults to 'USD'. */
+    displayCurrency?: string;
   }) {
     const {
       buyerAddress,
@@ -243,6 +293,8 @@ export class ShipmentsService {
       isDraft,
       favorite,
       callerUserId,
+      fields,
+      displayCurrency = 'USD',
     } = filters;
 
     if (cursor && page && page !== 1) {
@@ -290,7 +342,17 @@ export class ShipmentsService {
     }
 
     // Scope to shipments where the caller is a participant (buyer/supplier/logistics/arbiter)
-    if (!isAdmin && callerStellarAddress) {
+    if (participantAddresses) {
+      where.AND = where.AND ?? [];
+      where.AND.push({
+        OR: [
+          { buyerAddress: { in: participantAddresses } },
+          { supplierAddress: { in: participantAddresses } },
+          { logisticsAddress: { in: participantAddresses } },
+          { arbiterAddress: { in: participantAddresses } },
+        ],
+      });
+    } else if (!isAdmin && callerStellarAddress) {
       where.AND = where.AND ?? [];
       where.AND.push({
         OR: [
@@ -306,17 +368,27 @@ export class ShipmentsService {
       ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
       : {};
 
+    // Sparse fieldsets (#390): push the selection into Prisma rather than
+    // trimming afterwards. When no fields are requested, keep the full include.
+    const milestonesQuery = { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } };
+    const projection: any = fields
+      ? { select: this.buildSelect(fields, { milestones: milestonesQuery, ...favoriteInclude }) }
+      : { include: { milestones: milestonesQuery, ...favoriteInclude } };
+
     let shipments: any[];
     let total: number | null = null;
     let nextCursor: string | null = null;
 
     if (search) {
-      const participantCondition =
-        !isAdmin && callerStellarAddress
-          ? `AND (buyer_address = $1 OR supplier_address = $1 OR logistics_address = $1 OR arbiter_address = $1)`
-          : '';
-      const participantParams =
-        !isAdmin && callerStellarAddress ? [callerStellarAddress] : [];
+      const scopeAddresses = participantAddresses
+        ? participantAddresses
+        : !isAdmin && callerStellarAddress
+          ? [callerStellarAddress]
+          : null;
+      const participantCondition = scopeAddresses
+        ? `AND (buyer_address = ANY($1::text[]) OR supplier_address = ANY($1::text[]) OR logistics_address = ANY($1::text[]) OR arbiter_address = ANY($1::text[]))`
+        : '';
+      const participantParams = scopeAddresses ? [scopeAddresses] : [];
 
       const query = `
         SELECT * FROM shipments
@@ -351,10 +423,12 @@ export class ShipmentsService {
       total = Number((countResult as any[])[0].count);
 
       for (const s of shipments) {
-        s.milestones = await db.milestone.findMany({
-          where: { shipmentId: s.id },
-          orderBy: { milestoneIndex: 'asc' },
-        });
+        if (!fields || fields.includes('milestones')) {
+          s.milestones = await db.milestone.findMany({
+            where: { shipmentId: s.id, deletedAt: null },
+            orderBy: { milestoneIndex: 'asc' },
+          });
+        }
         if (callerUserId) {
           s.favorites = await this.prisma.shipmentFavorite.findMany({
             where: { shipmentId: s.id, userId: callerUserId },
@@ -373,10 +447,7 @@ export class ShipmentsService {
       const db = this.prisma.read;
       shipments = await db.shipment.findMany({
         where: { ...where, createdAt: { lte: new Date(decoded.createdAt) } },
-        include: {
-          milestones: { orderBy: { milestoneIndex: 'asc' } },
-          ...favoriteInclude,
-        },
+        ...projection,
         orderBy: { createdAt: 'desc' },
         cursor: { id: decoded.id },
         skip: 1,
@@ -397,10 +468,7 @@ export class ShipmentsService {
       [shipments, total] = await db.$transaction([
         db.shipment.findMany({
           where,
-          include: {
-            milestones: { orderBy: { milestoneIndex: 'asc' } },
-            ...favoriteInclude,
-          },
+          ...projection,
           orderBy: { createdAt: 'desc' },
           skip: (page - 1) * limit,
           take: limit,
@@ -411,7 +479,10 @@ export class ShipmentsService {
 
     return {
       data: await Promise.all(
-        shipments.map((s) => this.serialize(s, callerUserId)),
+        shipments.map(async (s) => {
+          const serialized = await this.serialize(s, callerUserId, undefined, displayCurrency);
+          return fields ? pickFields(serialized, fields) : serialized;
+        }),
       ),
       meta: cursor
         ? { nextCursor, limit }
@@ -425,22 +496,50 @@ export class ShipmentsService {
     };
   }
 
-  async findOne(id: string, callerUserId?: string) {
+  async findOne(id: string, callerUserId?: string, precisionOverride?: number, fields?: string[], displayCurrency = 'USD') {
     const db = this.prisma.read;
-    const shipment = await db.shipment.findUnique({
+    const relations = {
+      milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' as const } },
+      events: { orderBy: { ledger: 'desc' as const }, take: 20 },
+      trackingUpdates: { orderBy: { createdAt: 'asc' as const } },
+      approvals: { orderBy: { createdAt: 'asc' as const } },
+      ...(callerUserId
+        ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
+        : {}),
+    };
+    const shipment: any = await db.shipment.findUnique({
       where: { id },
-      include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
-        events: { orderBy: { ledger: 'desc' }, take: 20 },
-        trackingUpdates: { orderBy: { createdAt: 'asc' } },
-        approvals: { orderBy: { createdAt: 'asc' } },
-        ...(callerUserId
-          ? { favorites: { where: { userId: callerUserId }, select: { id: true } } }
-          : {}),
-      },
-    });
+      ...(fields ? { select: this.buildSelect(fields, relations) } : { include: relations }),
+    } as any);
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
-    return this.serialize(shipment, callerUserId);
+    const serialized = await this.serialize(shipment, callerUserId, precisionOverride, displayCurrency);
+    return fields ? pickFields(serialized, fields) : serialized;
+  }
+
+  /**
+   * findAll with a short-lived per-caller Redis cache. The key hashes every
+   * filter — including the sparse fieldset — so different field selections
+   * never share an entry (#390).
+   */
+  async findAllCached(filters: Parameters<ShipmentsService['findAll']>[0]) {
+    const caller = filters.callerStellarAddress;
+    if (!caller || filters.search) return this.findAll(filters);
+
+    const key = this.buildCacheKey(caller, filters);
+    try {
+      const cached = await this.redis.getJson<Awaited<ReturnType<ShipmentsService['findAll']>>>(key);
+      if (cached) return cached;
+    } catch (err) {
+      this.logger.warn(`Shipment list cache read failed: ${(err as Error).message}`);
+    }
+
+    const result = await this.findAll(filters);
+    try {
+      await this.redis.setJson(key, result, this.cacheTtl);
+    } catch (err) {
+      this.logger.warn(`Shipment list cache write failed: ${(err as Error).message}`);
+    }
+    return result;
   }
 
   /**
@@ -640,7 +739,7 @@ export class ShipmentsService {
    * Only the buyer can update a shipment.
    * Financial fields and addresses are immutable and ignored if provided.
    */
-  async update(id: string, buyerAddress: string, dto: any) {
+  async update(id: string, buyerAddress: string, dto: any, ifMatch?: string) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
     });
@@ -648,6 +747,7 @@ export class ShipmentsService {
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     // Verify buyer is the one making the update
     if (shipment.buyerAddress !== buyerAddress) {
@@ -670,19 +770,214 @@ export class ShipmentsService {
     if (dto.referenceNumber !== undefined) updateData.referenceNumber = dto.referenceNumber;
     if (dto.metadata !== undefined) updateData.metadata = dto.metadata;
     if (dto.tags !== undefined) updateData.tags = dto.tags;
+    if (dto.expectedDeliveryAt !== undefined) {
+      if (shipment.status !== ShipmentStatus.ACTIVE) {
+        throw new ConflictException(`Shipment is not ACTIVE (current status: ${shipment.status})`);
+      }
+      updateData.expectedDeliveryAt = dto.expectedDeliveryAt ? new Date(dto.expectedDeliveryAt) : null;
+    }
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: updateData,
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
 
+    // Record before/after snapshots of the changed fields only (#436).
+    const changes = computeFieldChanges(
+      shipment as unknown as Record<string, unknown>,
+      updateData,
+      Object.keys(updateData),
+    );
+    if (changes.length > 0) {
+      await this.auditLog.record({
+        actorId: callerId,
+        actorAddress: buyerAddress,
+        action: 'SHIPMENT_UPDATED',
+        resourceType: 'Shipment',
+        resourceId: id,
+        metadata: { changes },
+      });
+    }
+
     this.logger.log(`Shipment updated: ${id}`);
     await this.invalidateUserCache(buyerAddress);
     return await this.serialize(updated);
+  }
+
+  /**
+   * GET /shipments/:id/history/:auditId/diff (#436)
+   * Field-level before/after values for one audit entry. Entries recorded
+   * before snapshots existed return an empty diff.
+   */
+  async getHistoryDiff(shipmentId: string, auditId: string, isAdmin = false) {
+    const entry = await this.prisma.auditLog.findFirst({
+      where: {
+        id: auditId,
+        OR: [
+          { resourceType: 'Shipment', resourceId: shipmentId },
+          { entityType: 'Shipment', entityId: shipmentId },
+        ],
+      },
+    });
+    if (!entry) {
+      throw new NotFoundException(`Audit entry ${auditId} not found for shipment ${shipmentId}`);
+    }
+    const changes = extractChanges(entry.metadata);
+    return isAdmin ? changes : changes.filter((c) => !isHiddenField(c.field));
+  }
+
+  /**
+   * GET /shipments/:id/documents
+   * Return every IPFS document linked to a shipment (proofs, dispute evidence, comment attachments)
+   * in one list, filtered by visibility rules and optional source filter, sorted by uploadedAt desc.
+   */
+  async getDocuments(
+    shipmentId: string,
+    callerAddress: string,
+    isAdmin = false,
+    source?: string,
+  ): Promise<ShipmentDocumentDto[]> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: {
+        id: true,
+        buyerAddress: true,
+        supplierAddress: true,
+        logisticsAddress: true,
+        arbiterAddress: true,
+      },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentId} not found`);
+    }
+
+    if (
+      !isAdmin &&
+      callerAddress !== shipment.buyerAddress &&
+      callerAddress !== shipment.supplierAddress &&
+      callerAddress !== shipment.logisticsAddress &&
+      callerAddress !== shipment.arbiterAddress
+    ) {
+      throw new ForbiddenException('Only shipment participants can view shipment documents');
+    }
+
+    // Comment visibility filtering
+    const isBuyerOrSupplier =
+      callerAddress === shipment.buyerAddress || callerAddress === shipment.supplierAddress;
+    const isInternalParty =
+      callerAddress === shipment.logisticsAddress || callerAddress === shipment.arbiterAddress;
+
+    const allowedVisibilities: CommentVisibility[] = [CommentVisibility.ALL];
+    if (isBuyerOrSupplier) allowedVisibilities.push(CommentVisibility.BUYER_SUPPLIER);
+    if (isInternalParty) allowedVisibilities.push(CommentVisibility.INTERNAL);
+    if (isAdmin) {
+      allowedVisibilities.push(CommentVisibility.BUYER_SUPPLIER, CommentVisibility.INTERNAL);
+    }
+
+    const [proofs, evidence, comments] = await Promise.all([
+      this.prisma.proofSubmission.findMany({
+        where: {
+          milestone: {
+            shipmentId,
+            deletedAt: null,
+          },
+        },
+        include: {
+          milestone: {
+            select: { milestoneIndex: true },
+          },
+        },
+      }),
+      this.prisma.disputeEvidence.findMany({
+        where: {
+          milestone: {
+            shipmentId,
+            deletedAt: null,
+          },
+          ipfsCid: { not: null },
+        },
+        include: {
+          milestone: {
+            select: { milestoneIndex: true },
+          },
+        },
+      }),
+      this.prisma.shipmentComment.findMany({
+        where: {
+          shipmentId,
+          deletedAt: null,
+          attachmentCid: { not: null },
+          visibility: { in: allowedVisibilities },
+        },
+        include: {
+          author: {
+            select: { stellarAddress: true },
+          },
+        },
+      }),
+    ]);
+
+    const items: ShipmentDocumentDto[] = [];
+
+    for (const p of proofs) {
+      if (p.ipfsCid) {
+        items.push({
+          source: 'PROOF',
+          cid: p.ipfsCid,
+          uploadedBy: p.submittedBy,
+          uploadedAt: p.createdAt,
+          milestoneIndex: p.milestone?.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${p.ipfsCid}`,
+        });
+      }
+    }
+
+    for (const e of evidence) {
+      if (e.ipfsCid) {
+        items.push({
+          source: 'DISPUTE_EVIDENCE',
+          cid: e.ipfsCid,
+          fileName: e.fileName ?? undefined,
+          mimeType: e.mimeType ?? undefined,
+          uploadedBy: e.submittedBy,
+          uploadedAt: e.createdAt,
+          milestoneIndex: e.milestone?.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${e.ipfsCid}`,
+        });
+      }
+    }
+
+    for (const c of comments) {
+      if (c.attachmentCid) {
+        items.push({
+          source: 'COMMENT',
+          cid: c.attachmentCid,
+          uploadedBy: c.author?.stellarAddress ?? c.authorId,
+          uploadedAt: c.createdAt,
+          milestoneIndex: c.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${c.attachmentCid}`,
+        });
+      }
+    }
+
+    let filtered = items;
+    if (source) {
+      const normalized = source.toUpperCase().trim();
+      filtered = filtered.filter((item) => {
+        if (normalized === 'PROOF' || normalized === 'PROOF_SUBMISSION') {
+          return item.source === 'PROOF';
+        }
+        return item.source === normalized;
+      });
+    }
+
+    filtered.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+
+    return filtered;
   }
 
   async replaceTags(
@@ -690,15 +985,17 @@ export class ShipmentsService {
     tags: string[] | undefined,
     callerAddress?: string,
     callerId?: string,
+    ifMatch?: string,
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
-      select: { id: true, tags: true },
+      select: { id: true, tags: true, updatedAt: true },
     });
 
     if (!shipment) {
       throw new NotFoundException(`Shipment ${id} not found`);
     }
+    this.assertIfMatch(shipment, ifMatch);
 
     if (!Array.isArray(tags)) {
       throw new BadRequestException('tags must be an array');
@@ -727,11 +1024,10 @@ export class ShipmentsService {
 
     const nextTags = Array.from(normalizedTags.values());
 
-    const updated = await this.prisma.shipment.update({
-      where: { id },
+    const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: { tags: nextTags },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -745,11 +1041,128 @@ export class ShipmentsService {
       metadata: {
         previousTags: shipment.tags,
         nextTags,
+        changes: computeFieldChanges({ tags: shipment.tags }, { tags: nextTags }, ['tags']),
       },
     });
 
     this.logger.log(`Shipment tags replaced: ${id}`);
     return await this.serialize(updated);
+  }
+
+  // ----------------------------------------------------------
+  // OPTIMISTIC CONCURRENCY (#387)
+  // ----------------------------------------------------------
+
+  /** Returns the current ETag for a shipment. */
+  async getEtag(id: string): Promise<string> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+      select: { id: true, updatedAt: true },
+    });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    return shipmentEtag(shipment);
+  }
+
+  private assertIfMatch(shipment: { id: string; updatedAt: Date }, ifMatch?: string) {
+    if (ifMatch === undefined || ifMatch === null || ifMatch === '') {
+      if (this.config.get<string>('SHIPMENT_REQUIRE_IF_MATCH') === 'true') {
+        throw new PreconditionFailedException('If-Match header is required');
+      }
+      return;
+    }
+    if (!ifMatchSatisfied(ifMatch, shipmentEtag(shipment))) {
+      throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+    }
+  }
+
+  /**
+   * Updates a shipment, and when an If-Match was supplied also pins the write
+   * to the updatedAt that was checked so a concurrent writer that slipped in
+   * between the read and the write causes a 412 instead of a lost update.
+   */
+  private async conditionalUpdate(
+    shipment: { id: string; updatedAt: Date },
+    ifMatch: string | undefined,
+    args: { data: any; include?: any },
+  ) {
+    const where: any = ifMatch
+      ? { id: shipment.id, updatedAt: shipment.updatedAt }
+      : { id: shipment.id };
+    try {
+      return await this.prisma.shipment.update({ where, ...args });
+    } catch (err: any) {
+      if (ifMatch && err?.code === 'P2025') {
+        throw new PreconditionFailedException('Shipment has been modified; refetch and retry');
+      }
+      throw err;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // DUPLICATE CHECK (#388)
+  // ----------------------------------------------------------
+
+  /**
+   * Finds the caller's ACTIVE shipments that look like duplicates of a
+   * shipment about to be created. Read-only.
+   */
+  async findPossibleDuplicates(
+    buyerAddress: string,
+    dto: { supplierAddress?: string; tokenAddress?: string; totalAmount?: string; referenceNumber?: string },
+  ) {
+    const since = new Date(Date.now() - DUPLICATE_WINDOW_MS);
+    let amount: bigint | undefined;
+    try {
+      amount = dto.totalAmount !== undefined ? BigInt(dto.totalAmount) : undefined;
+    } catch {
+      throw new BadRequestException('totalAmount must be an integer string');
+    }
+
+    const or: any[] = [];
+    if (dto.supplierAddress && dto.tokenAddress && amount !== undefined) {
+      or.push({
+        supplierAddress: dto.supplierAddress,
+        tokenAddress: dto.tokenAddress,
+        totalAmount: amount,
+        createdAt: { gte: since },
+      });
+    }
+    if (dto.referenceNumber) {
+      or.push({ referenceNumber: dto.referenceNumber });
+    }
+    if (or.length === 0) return { possibleDuplicates: [] };
+
+    const matches = await this.prisma.shipment.findMany({
+      where: { buyerAddress, status: ShipmentStatus.ACTIVE, OR: or },
+      select: {
+        id: true,
+        createdAt: true,
+        referenceNumber: true,
+        supplierAddress: true,
+        tokenAddress: true,
+        totalAmount: true,
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return {
+      possibleDuplicates: matches.map((m) => {
+        const matchReasons: string[] = [];
+        if (
+          amount !== undefined &&
+          m.supplierAddress === dto.supplierAddress &&
+          m.tokenAddress === dto.tokenAddress &&
+          BigInt(m.totalAmount) === amount &&
+          m.createdAt >= since
+        ) {
+          matchReasons.push('SAME_SUPPLIER_TOKEN_AMOUNT_WITHIN_7_DAYS');
+        }
+        if (dto.referenceNumber && m.referenceNumber === dto.referenceNumber) {
+          matchReasons.push('SAME_REFERENCE_NUMBER');
+        }
+        return { id: m.id, createdAt: m.createdAt, referenceNumber: m.referenceNumber, matchReasons };
+      }),
+    };
   }
 
   // ----------------------------------------------------------
@@ -793,7 +1206,7 @@ export class ShipmentsService {
         },
       },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -842,7 +1255,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
         events: { orderBy: { ledger: 'desc' }, take: 20 },
       },
     });
@@ -853,6 +1266,98 @@ export class ShipmentsService {
   }
 
   // ----------------------------------------------------------
+  // REFUND DETAIL
+  // ----------------------------------------------------------
+
+  /**
+   * Returns refund details for a cancelled shipment.
+   * Looks up the shipment_cancelled ChainEvent to extract the refunded amount.
+   */
+  async getRefundDetail(id: string) {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${id} not found`);
+    }
+
+    if (!shipment.cancelledAt) {
+      throw new NotFoundException(`Shipment ${id} has not been cancelled`);
+    }
+
+    // Look up the corresponding ChainEvent for refund amount
+    const cancelEvent = await this.prisma.chainEvent.findFirst({
+      where: {
+        shipmentId: id,
+        eventName: 'shipment_cancelled',
+      },
+      orderBy: { ledger: 'desc' },
+    });
+
+    if (!cancelEvent) {
+      throw new InternalServerErrorException(
+        `Cancellation chain event not found for shipment ${id}. The on-chain event may not have been processed yet.`,
+      );
+    }
+
+    // Extract refunded amount from the event payload.
+    // Payload is expected to be [shipmentId, refundedAmount] (matching other event shapes).
+    // If only shipmentId is present, fall back to totalAmount as the refund.
+    let refundedAmountRaw: bigint;
+    try {
+      const payload = cancelEvent.payload as any;
+      if (Array.isArray(payload) && payload.length >= 2) {
+        refundedAmountRaw = BigInt(payload[1] ?? 0);
+      } else {
+        // Fallback: full escrow amount is refunded on cancellation
+        refundedAmountRaw = shipment.totalAmount;
+      }
+    } catch {
+      this.logger.warn(
+        `Failed to parse refund amount from payload for shipment ${id}, falling back to totalAmount`,
+      );
+      refundedAmountRaw = shipment.totalAmount;
+    }
+
+    const decimals: number = shipment.tokenDecimals ?? 7;
+
+    return {
+      cancelledAt: shipment.cancelledAt.toISOString(),
+      refundTxHash: shipment.refundTxHash ?? cancelEvent.txHash,
+      refundedAmount: this.stellar.toHumanAmount(refundedAmountRaw, decimals),
+      refundedTo: shipment.buyerAddress,
+    };
+  }
+
+  // ----------------------------------------------------------
+  private async getArbiterWarnings(arbiterAddress: string, buyerAddress: string, supplierAddress: string): Promise<string[]> {
+    const since = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+    const relatedTrade = await this.prisma.shipment.findFirst({ where: { createdAt: { gte: since }, OR: [
+      { buyerAddress: arbiterAddress, supplierAddress: { in: [buyerAddress, supplierAddress] } },
+      { supplierAddress: arbiterAddress, buyerAddress: { in: [buyerAddress, supplierAddress] } },
+    ] }, select: { id: true } });
+    const [total, sameBuyer] = await Promise.all([
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress } } }),
+      this.prisma.milestone.count({ where: { status: 'RESOLVED', shipment: { arbiterAddress, buyerAddress } } }),
+    ]);
+    const threshold = Math.min(1, Math.max(0, Number(process.env.ARBITER_REPEAT_BUYER_WARNING_THRESHOLD ?? 0.5)));
+    const warnings: string[] = [];
+    if (relatedTrade) warnings.push('Arbiter has traded with a shipment party in the last 12 months.');
+    if (total > 0 && sameBuyer / total > threshold) warnings.push(`More than ${Math.round(threshold * 100)}% of this arbiter's past resolutions involved this buyer.`);
+    return warnings;
+  }
+
+  async replaceArbiter(id: string, buyerAddress: string, arbiterAddress: string) {
+    const shipment = await this.prisma.shipment.findUnique({ where: { id } });
+    if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
+    if (shipment.buyerAddress !== buyerAddress) throw new ForbiddenException('Only the buyer may replace the arbiter');
+    if (shipment.arbiterStatus === ArbiterStatus.ACCEPTED) throw new ConflictException('An accepted arbiter cannot be replaced');
+    if ([shipment.buyerAddress, shipment.supplierAddress, shipment.logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+    const updated = await this.prisma.shipment.update({ where: { id }, data: { arbiterAddress, arbiterStatus: ArbiterStatus.PENDING_ACCEPTANCE } });
+    await this.notifications.notifyUser(arbiterAddress, NotificationType.ARBITER_INVITED, 'Arbiter assignment invitation', `You have been assigned as arbiter for shipment ${id}.`, { shipmentId: id, buyerAddress, supplierAddress: shipment.supplierAddress });
+    return { ...(await this.serialize(updated)), warnings: await this.getArbiterWarnings(arbiterAddress, buyerAddress, shipment.supplierAddress) };
+  }
   // ARBITER ACCEPT / DECLINE
   // ----------------------------------------------------------
 
@@ -958,7 +1463,7 @@ export class ShipmentsService {
         cancelledAt: new Date(),
         refundTxHash: txHash || undefined,
       },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} cancelled by buyer ${buyerAddress}`);
@@ -1047,7 +1552,7 @@ export class ShipmentsService {
   async clone(id: string, buyerAddress: string, dto: CloneShipmentDto) {
     const source = await this.prisma.shipment.findUnique({
       where: { id },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     if (!source) throw new NotFoundException(`Shipment ${id} not found`);
@@ -1119,7 +1624,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.update({
       where: { id },
       data: { archivedAt: new Date() },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} archived by buyer ${buyerAddress}`);
@@ -1148,7 +1653,7 @@ export class ShipmentsService {
     const updated = await this.prisma.shipment.update({
       where: { id },
       data: { archivedAt: null },
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
     });
 
     this.logger.log(`Shipment ${id} unarchived by buyer ${buyerAddress}`);
@@ -1315,7 +1820,7 @@ export class ShipmentsService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      select: { logisticsAddress: true, buyerAddress: true, supplierAddress: true, id: true },
+      select: { logisticsAddress: true, buyerAddress: true, supplierAddress: true, id: true, expectedDeliveryAt: true },
     });
 
     if (!shipment) {
@@ -1325,6 +1830,11 @@ export class ShipmentsService {
     if (shipment.logisticsAddress !== callerAddress) {
       throw new ForbiddenException('Only the logistics participant can submit tracking updates');
     }
+
+    const latestPriorTracking = await this.prisma.trackingUpdate.findFirst({
+      where: { shipmentId: shipment.id },
+      orderBy: { createdAt: 'desc' },
+    });
 
     const trackingUpdate = await this.prisma.trackingUpdate.create({
       data: {
@@ -1370,6 +1880,41 @@ export class ShipmentsService {
         estimatedArrival: trackingUpdate.estimatedArrival?.toISOString() ?? null,
       },
     );
+
+    // If tracking update has an estimatedArrival later than expectedDeliveryAt, notify buyer and supplier (DELIVERY_DELAYED)
+    if (dto.estimatedArrival && shipment.expectedDeliveryAt) {
+      const newEta = new Date(dto.estimatedArrival);
+      if (newEta > shipment.expectedDeliveryAt) {
+        const priorEtaTime = latestPriorTracking?.estimatedArrival
+          ? new Date(latestPriorTracking.estimatedArrival).getTime()
+          : null;
+        if (newEta.getTime() !== priorEtaTime) {
+          const delayTitle = 'Shipment delivery delayed';
+          const delayMessage = `Delivery for shipment ${shipment.id} is delayed. New ETA: ${newEta.toISOString()} (promised: ${shipment.expectedDeliveryAt.toISOString()}).`;
+          const delayPayload = {
+            shipmentId: shipment.id,
+            expectedDeliveryAt: shipment.expectedDeliveryAt.toISOString(),
+            estimatedArrival: newEta.toISOString(),
+          };
+
+          await this.notifications.notifyUser(
+            shipment.buyerAddress,
+            NotificationType.DELIVERY_DELAYED,
+            delayTitle,
+            delayMessage,
+            delayPayload,
+          );
+
+          await this.notifications.notifyUser(
+            shipment.supplierAddress,
+            NotificationType.DELIVERY_DELAYED,
+            delayTitle,
+            delayMessage,
+            delayPayload,
+          );
+        }
+      }
+    }
 
     this.logger.log(`Tracking update created for shipment ${shipmentId} by ${callerAddress}: ${trackingUpdate.status} at ${trackingUpdate.location}`);
     return trackingUpdate;
@@ -1420,20 +1965,20 @@ export class ShipmentsService {
         logisticsAddress: true,
         arbiterAddress: true,
         arbiterStatus: true,
-        buyer: { select: { name: true } },
-        supplier: { select: { name: true } },
-        logistics: { select: { name: true } },
-        arbiter: { select: { name: true } },
+        buyer: { select: { name: true, organizationName: true, countryCode: true } },
+        supplier: { select: { name: true, organizationName: true, countryCode: true } },
+        logistics: { select: { name: true, organizationName: true, countryCode: true } },
+        arbiter: { select: { name: true, organizationName: true, countryCode: true } },
       },
     });
 
     if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
 
     return [
-      { role: 'BUYER', stellarAddress: shipment.buyerAddress, name: shipment.buyer.name ?? null },
-      { role: 'SUPPLIER', stellarAddress: shipment.supplierAddress, name: shipment.supplier.name ?? null },
-      { role: 'LOGISTICS', stellarAddress: shipment.logisticsAddress, name: shipment.logistics.name ?? null },
-      { role: 'ARBITER', stellarAddress: shipment.arbiterAddress, name: shipment.arbiter.name ?? null, arbiterStatus: shipment.arbiterStatus },
+      { role: 'BUYER', stellarAddress: shipment.buyerAddress, name: shipment.buyer.name ?? null, organizationName: shipment.buyer.organizationName ?? null, countryCode: shipment.buyer.countryCode ?? null },
+      { role: 'SUPPLIER', stellarAddress: shipment.supplierAddress, name: shipment.supplier.name ?? null, organizationName: shipment.supplier.organizationName ?? null, countryCode: shipment.supplier.countryCode ?? null },
+      { role: 'LOGISTICS', stellarAddress: shipment.logisticsAddress, name: shipment.logistics.name ?? null, organizationName: shipment.logistics.organizationName ?? null, countryCode: shipment.logistics.countryCode ?? null },
+      { role: 'ARBITER', stellarAddress: shipment.arbiterAddress, name: shipment.arbiter.name ?? null, organizationName: shipment.arbiter.organizationName ?? null, countryCode: shipment.arbiter.countryCode ?? null, arbiterStatus: shipment.arbiterStatus },
     ];
   }
 
@@ -1617,9 +2162,17 @@ export class ShipmentsService {
       ];
     }
 
+    const userSelect = { select: { name: true, organizationName: true } };
+
     return this.prisma.shipment.findMany({
       where,
-      include: { milestones: { orderBy: { milestoneIndex: 'asc' } } },
+      include: {
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        buyer:     userSelect,
+        supplier:  userSelect,
+        logistics: userSelect,
+        arbiter:   userSelect,
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -1628,6 +2181,7 @@ export class ShipmentsService {
     const headers = [
       'shipmentId', 'buyerAddress', 'supplierAddress', 'logisticsAddress',
       'arbiterAddress', 'totalAmount', 'releasedAmount', 'status', 'createdAt',
+      'expectedDeliveryAt',
       'milestoneName', 'milestoneIndex', 'paymentPercent', 'milestoneStatus',
       'proofHash', 'confirmedAt',
     ];
@@ -1653,6 +2207,7 @@ export class ShipmentsService {
         toUsdc(s.releasedAmount),
         s.status,
         s.createdAt?.toISOString() ?? '',
+        s.expectedDeliveryAt ? (s.expectedDeliveryAt instanceof Date ? s.expectedDeliveryAt.toISOString() : new Date(s.expectedDeliveryAt).toISOString()) : '',
       ];
 
       if (!s.milestones?.length) {
@@ -1694,13 +2249,16 @@ export class ShipmentsService {
         doc.fontSize(9);
 
         const participants = [
-          ['Buyer', s.buyerAddress],
-          ['Supplier', s.supplierAddress],
-          ['Logistics', s.logisticsAddress],
-          ['Arbiter', s.arbiterAddress],
+          ['Buyer',     s.buyerAddress,     s.buyer],
+          ['Supplier',  s.supplierAddress,  s.supplier],
+          ['Logistics', s.logisticsAddress, s.logistics],
+          ['Arbiter',   s.arbiterAddress,   s.arbiter],
         ];
-        for (const [role, addr] of participants) {
-          doc.text(`${role}: ${addr}`);
+        for (const [role, addr, user] of participants) {
+          const label = user?.organizationName
+            ? `${role}: ${addr} (${user.organizationName})`
+            : `${role}: ${addr}`;
+          doc.text(label);
         }
 
         doc.moveDown(0.5);
@@ -1731,9 +2289,17 @@ export class ShipmentsService {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id },
       include: {
-        milestones: { orderBy: { milestoneIndex: 'asc' } },
+        milestones: {
+          where: { deletedAt: null },
+          orderBy: { milestoneIndex: 'asc' },
+          include: { proofSubmissions: { orderBy: { createdAt: 'desc' }, take: 1 } },
+        },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
+        buyer:     { select: { name: true, organizationName: true } },
+        supplier:  { select: { name: true, organizationName: true } },
+        logistics: { select: { name: true, organizationName: true } },
+        arbiter:   { select: { name: true, organizationName: true } },
       },
     });
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
@@ -1759,13 +2325,16 @@ export class ShipmentsService {
       doc.fontSize(9);
 
       const participants = [
-        ['Buyer', shipment.buyerAddress],
-        ['Supplier', shipment.supplierAddress],
-        ['Logistics', shipment.logisticsAddress],
-        ['Arbiter', shipment.arbiterAddress],
+        ['Buyer',     shipment.buyerAddress,     shipment.buyer],
+        ['Supplier',  shipment.supplierAddress,  shipment.supplier],
+        ['Logistics', shipment.logisticsAddress, shipment.logistics],
+        ['Arbiter',   shipment.arbiterAddress,   shipment.arbiter],
       ];
-      for (const [role, addr] of participants) {
-        doc.text(`${role}: ${addr}`);
+      for (const [role, addr, user] of participants) {
+        const label = (user as any)?.organizationName
+          ? `${role}: ${addr} (${(user as any).organizationName})`
+          : `${role}: ${addr}`;
+        doc.text(label);
       }
 
       doc.moveDown(0.5);
@@ -1779,7 +2348,8 @@ export class ShipmentsService {
           doc.text(
             `  [${m.milestoneIndex}] ${m.name} — ${m.paymentPercent}% — ${m.status}` +
             (m.confirmedAt ? ` — confirmed ${m.confirmedAt.toISOString()}` : '') +
-            (m.proofHash ? ` — Proof: ${m.proofHash}` : ''),
+            (m.proofHash ? ` — Proof: ${m.proofHash}` : '') +
+            (m.proofSubmissions?.[0]?.sha256 ? ` — SHA-256: ${m.proofSubmissions[0].sha256}` : ''),
           );
         }
       }
@@ -1925,6 +2495,8 @@ export class ShipmentsService {
         const description = (r.description ?? '').trim();
         const referenceNumber = (r.referenceNumber ?? r.referencenumber ?? '').trim();
 
+        if (arbiterAddress && [buyerAddress, supplierAddress, logisticsAddress].some(a => a.toLowerCase() === arbiterAddress.toLowerCase())) throw new BadRequestException({ code: 'ARBITER_CONFLICT', message: 'Arbiter cannot be a shipment party' });
+
         // Validate required fields
         if (!supplierAddress) throw new Error('supplierAddress is required');
         if (!logisticsAddress) throw new Error('logisticsAddress is required');
@@ -1965,6 +2537,29 @@ export class ShipmentsService {
           throw new Error(`Unknown tokenAddress "${tokenAddress}"`);
         }
 
+        // Parse milestones if provided
+        const milestoneData: { name: string; paymentPercent: number; milestoneIndex: number }[] = [];
+        if (milestonesRaw) {
+          const parts = milestonesRaw.split('|');
+          let sum = 0;
+          for (let idx = 0; idx < parts.length; idx++) {
+            const part = parts[idx];
+            const [name, percentStr] = part.split(':');
+            if (!name || !percentStr) {
+              throw new Error(`Invalid milestone format in "${part}". Expected Name:Percent`);
+            }
+            const percent = parseInt(percentStr.trim(), 10);
+            if (isNaN(percent) || percent <= 0) {
+              throw new Error(`Milestone percentage must be a positive number in "${part}"`);
+            }
+            sum += percent;
+            milestoneData.push({ name: name.trim(), paymentPercent: percent, milestoneIndex: idx });
+          }
+          if (sum !== 100) {
+            throw new Error(`Milestone percentages must sum to 100. Got ${sum}.`);
+          }
+        }
+
         const shipmentId = randomUUID();
 
         const shipment = await this.prisma.shipment.create({
@@ -1981,7 +2576,8 @@ export class ShipmentsService {
             description: description || null,
             referenceNumber: referenceNumber || null,
             isDraft: true,
-            // Draft shipments have no txHash, createdLedger, milestones, or on-chain backing
+            milestones: milestoneData.length > 0 ? { create: milestoneData } : undefined,
+            // Draft shipments have no txHash, createdLedger, or on-chain backing
           },
         });
 
@@ -2025,6 +2621,25 @@ export class ShipmentsService {
   // INTERNAL HELPERS
   // ----------------------------------------------------------
 
+  /**
+   * Prisma `select` for a sparse fieldset. Always includes the columns the
+   * serializer needs (id, createdAt for cursors, token decimals/symbol for
+   * amount formatting); those extras are trimmed by pickFields() afterwards.
+   */
+  private buildSelect(fields: string[], relations: Record<string, any>): Record<string, any> {
+    const select: Record<string, any> = {
+      id: true,
+      createdAt: true,
+      tokenDecimals: true,
+      tokenSymbol: true,
+    };
+    for (const f of fields) {
+      select[f] = relations[f] ?? true;
+    }
+    if (relations.favorites) select.favorites = relations.favorites;
+    return select;
+  }
+
   private buildCacheKey(callerStellarAddress: string, filters: Record<string, any>): string {
     const hash = createHash('sha256')
       .update(JSON.stringify(filters))
@@ -2037,26 +2652,38 @@ export class ShipmentsService {
     await this.redis.delByPrefix(`shipments:${callerStellarAddress}:`);
   }
 
-  private async serialize(shipment: any, callerUserId?: string) {
+  private async serialize(shipment: any, callerUserId?: string, precisionOverride?: number, displayCurrency = 'USD') {
     const now = new Date();
     const decimals: number = shipment.tokenDecimals ?? 7;
     const symbol: string = shipment.tokenSymbol ?? 'USDC';
+    const currency = displayCurrency.toUpperCase();
 
-    // Estimated USD value (#231) — omitted entirely when no rate is cached,
-    // never causes the response to fail.
-    const fxRate = await this.fxRate.getUsdRate(symbol);
-    const estimatedUsdValue = fxRate
-      ? {
-          totalAmountUsd: (
-            Number(this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals)) * fxRate.rate
-          ).toFixed(2),
-          releasedAmountUsd: (
-            Number(this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals)) * fxRate.rate
-          ).toFixed(2),
-          rate: fxRate.rate,
-          asOf: fxRate.asOf,
-          estimate: true,
-        }
+    // Estimated display-currency value (#231 / displayCurrency).
+    // Uses convertForDisplay which handles token→USD then USD→target cross-rate.
+    // Omitted entirely when no FX rate is cached — never causes the response to fail.
+    // Fetch both rates once and reuse for totalAmount and releasedAmount.
+    const [tokenUsdRate, fiatRate] = await Promise.all([
+      this.fxRate.getUsdRate(symbol),
+      this.fxRate.getFiatRate(currency),
+    ]);
+
+    const estimatedUsdValue = (tokenUsdRate && fiatRate)
+      ? (() => {
+          const effectiveRate = tokenUsdRate.rate * fiatRate.rate;
+          const totalHuman = Number(this.stellar.toHumanAmount(shipment.totalAmount ?? 0n, decimals));
+          const releasedHuman = Number(this.stellar.toHumanAmount(shipment.releasedAmount ?? 0n, decimals));
+          const precision = precisionOverride ?? this.fxRate.getDisplayPrecision(currency);
+          const asOf = tokenUsdRate.asOf < fiatRate.asOf ? tokenUsdRate.asOf : fiatRate.asOf;
+          return {
+            totalAmountUsd: this.fxRate.formatValue(totalHuman, effectiveRate, currency, precisionOverride),
+            releasedAmountUsd: this.fxRate.formatValue(releasedHuman, effectiveRate, currency, precisionOverride),
+            precision,
+            currency,
+            rate: effectiveRate,
+            asOf,
+            estimate: true,
+          };
+        })()
       : undefined;
 
     const trackingUpdates = shipment.trackingUpdates?.map((t: any) => ({

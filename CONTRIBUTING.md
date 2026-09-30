@@ -2,7 +2,7 @@
 
 Thanks for contributing! This guide covers the contributor workflow — setup, branching,
 commits, tests, and PR expectations. For architecture, module overview, and API details,
-see [README.md](README.md).
+see [README.md](README.md). If you run into setup or runtime errors, see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ---
 
@@ -101,6 +101,9 @@ npm run test       # Unit tests
 npm run test:cov   # Unit tests with coverage
 npm run format     # Prettier
 ```
+
+> For a full breakdown of every test category (unit, e2e, load tests, Pact, and shell
+> scripts), required local services, and CI setup, see [docs/testing.md](docs/testing.md).
 
 If your change touches an endpoint used by the frontend or event polling, also run:
 

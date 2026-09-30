@@ -13,6 +13,9 @@ export class NotificationDigestJob {
     private readonly notifications: NotificationsService,
   ) {}
 
+  @Cron('*/1 * * * *')
+  async deliverDeferred() { await this.notifications.deliverDeferredNotifications(); }
+
   // Runs daily; 'weekly' subscribers are only included when this lands on a
   // Monday (JS Date#getDay() === 1) — a fixed day chosen for simplicity.
   @Cron('0 8 * * *')
@@ -34,6 +37,7 @@ export class NotificationDigestJob {
       try {
         const digestFrequency = await this.notifications.getDigestFrequency(user.id);
         if (digestFrequency === 'instant') continue;
+        if (await this.notifications.isQuietHours(user.id)) continue;
         if (digestFrequency === 'weekly' && !isWeeklyDigestDay) continue;
 
         const prefs = await this.notifications.getOrCreatePreferences(user.id);

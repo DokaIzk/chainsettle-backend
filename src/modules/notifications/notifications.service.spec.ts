@@ -161,6 +161,73 @@ describe('NotificationsService — preferences', () => {
     });
   });
 
+  describe('grouped shipment notifications', () => {
+    it('groups notifications by shipment and returns the newest three in each group', async () => {
+      const prisma = buildPrisma();
+      prisma.notification.findMany.mockResolvedValue([
+        {
+          id: 'n-3',
+          userId: 'user-1',
+          type: NotificationType.PROOF_SUBMITTED,
+          title: 'Proof received',
+          message: 'Third',
+          data: { shipmentId: 'ship-1' },
+          read: false,
+          createdAt: new Date('2024-01-03T00:00:00Z'),
+        },
+        {
+          id: 'n-2',
+          userId: 'user-1',
+          type: NotificationType.DISPUTE_RAISED,
+          title: 'Dispute raised',
+          message: 'Second',
+          data: { shipmentId: 'ship-1' },
+          read: true,
+          createdAt: new Date('2024-01-02T00:00:00Z'),
+        },
+        {
+          id: 'n-1',
+          userId: 'user-1',
+          type: NotificationType.SYSTEM_ALERT,
+          title: 'System alert',
+          message: 'General',
+          data: {},
+          read: false,
+          createdAt: new Date('2024-01-01T00:00:00Z'),
+        },
+      ]);
+      prisma.shipment = { findMany: jest.fn().mockResolvedValue([{ id: 'ship-1', referenceNumber: 'REF-123' }]) };
+
+      const service = await buildService(prisma);
+      const result = await service.findForUser('user-1', false, 1, 20, 'shipment');
+
+      expect(result.data).toHaveLength(2);
+      expect(result.data[0]).toMatchObject({ shipmentId: 'ship-1', referenceNumber: 'REF-123', unreadCount: 1 });
+      expect(result.data[0].notifications).toHaveLength(2);
+      expect(result.data[1].shipmentId).toBeNull();
+    });
+
+    it('marks all notifications for a shipment as read and returns an updated count', async () => {
+      const prisma = buildPrisma();
+      prisma.notification.updateMany.mockResolvedValue({ count: 2 });
+      prisma.notification.count.mockResolvedValue(1);
+      const service = await buildService(prisma);
+
+      const result = await (service as any).markReadByShipment('user-1', 'ship-1');
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            userId: 'user-1',
+            read: false,
+          }),
+          data: { read: true },
+        }),
+      );
+      expect(result).toEqual({ updatedCount: 2 });
+    });
+  });
+
   describe('Slack channel', () => {
     const originalFetch = global.fetch;
 
@@ -194,6 +261,127 @@ describe('NotificationsService — preferences', () => {
 
       expect(global.fetch).not.toHaveBeenCalled();
       expect(prisma.notification.create).toHaveBeenCalledTimes(1);
+    });
+  });
+});
+
+describe('NotificationsService — snooze', () => {
+  const USER_ID = 'user-1';
+  const NOTIF_ID = 'notif-1';
+
+  afterEach(() => jest.clearAllMocks());
+
+  // ── snooze() ──────────────────────────────────────────────────────────────
+
+  describe('snooze()', () => {
+    it('calls updateMany with a future snoozedUntil timestamp', async () => {
+      const prisma = buildPrisma();
+      const service = await buildService(prisma);
+      const futureDate = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 h from now
+
+      await service.snooze(USER_ID, NOTIF_ID, futureDate);
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith({
+        where: { id: NOTIF_ID, userId: USER_ID },
+        data: { snoozedUntil: new Date(futureDate) },
+      });
+    });
+
+    it('throws BadRequestException when the until date is in the past', async () => {
+      const { BadRequestException } = await import('@nestjs/common');
+      const prisma = buildPrisma();
+      const service = await buildService(prisma);
+      const pastDate = new Date(Date.now() - 1000).toISOString();
+
+      await expect(service.snooze(USER_ID, NOTIF_ID, pastDate)).rejects.toThrow(BadRequestException);
+      // updateMany must never be called when the date is invalid
+      expect(prisma.notification.updateMany).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException when no row matches (wrong owner or missing id)', async () => {
+      const { NotFoundException } = await import('@nestjs/common');
+      const prisma = buildPrisma();
+      prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+      const service = await buildService(prisma);
+      const futureDate = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+      await expect(service.snooze(USER_ID, NOTIF_ID, futureDate)).rejects.toThrow(NotFoundException);
+    });
+
+    it('does not mutate the read flag when snoozing', async () => {
+      const prisma = buildPrisma();
+      const service = await buildService(prisma);
+      const futureDate = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+      await service.snooze(USER_ID, NOTIF_ID, futureDate);
+
+      const callData = prisma.notification.updateMany.mock.calls[0][0].data;
+      expect(callData).not.toHaveProperty('read');
+    });
+  });
+
+  // ── unsnooze() ────────────────────────────────────────────────────────────
+
+  describe('unsnooze()', () => {
+    it('calls updateMany with snoozedUntil: null', async () => {
+      const prisma = buildPrisma();
+      const service = await buildService(prisma);
+
+      await service.unsnooze(USER_ID, NOTIF_ID);
+
+      expect(prisma.notification.updateMany).toHaveBeenCalledWith({
+        where: { id: NOTIF_ID, userId: USER_ID },
+        data: { snoozedUntil: null },
+      });
+    });
+
+    it('throws NotFoundException when no row matches', async () => {
+      const { NotFoundException } = await import('@nestjs/common');
+      const prisma = buildPrisma();
+      prisma.notification.updateMany.mockResolvedValue({ count: 0 });
+      const service = await buildService(prisma);
+
+      await expect(service.unsnooze(USER_ID, NOTIF_ID)).rejects.toThrow(NotFoundException);
+    });
+  });
+
+  // ── findForUser() snooze filter ───────────────────────────────────────────
+
+  describe('findForUser() — snooze filtering', () => {
+    it('passes an OR clause that excludes actively-snoozed notifications', async () => {
+      const prisma = buildPrisma();
+      prisma.$transaction.mockResolvedValue([[], 0]);
+      const service = await buildService(prisma);
+
+      await service.findForUser(USER_ID);
+
+      expect(prisma.notification.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            OR: [
+              { snoozedUntil: null },
+              { snoozedUntil: expect.objectContaining({ lt: expect.any(Date) }) },
+            ],
+          }),
+        }),
+      );
+    });
+
+    it('includes notifications with a snoozedUntil in the past (expired snooze)', async () => {
+      // The OR filter uses lt: new Date(), so an expired-snooze row satisfies the second branch.
+      // We verify this by checking the lt value is <= now at the time of the call.
+      const prisma = buildPrisma();
+      prisma.$transaction.mockResolvedValue([[], 0]);
+      const before = new Date();
+      const service = await buildService(prisma);
+
+      await service.findForUser(USER_ID);
+
+      const after = new Date();
+      const callWhere = prisma.notification.findMany.mock.calls[0][0].where;
+      const ltValue: Date = callWhere.OR[1].snoozedUntil.lt;
+      expect(ltValue.getTime()).toBeGreaterThanOrEqual(before.getTime());
+      expect(ltValue.getTime()).toBeLessThanOrEqual(after.getTime());
     });
   });
 });
