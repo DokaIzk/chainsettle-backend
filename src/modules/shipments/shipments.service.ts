@@ -22,7 +22,8 @@ import { ShipmentApprovalsService } from './shipment-approvals.service';
 import { FxRateService } from '../../common/fx/fx-rate.service';
 import { CreateShipmentDto, CloneShipmentDto } from './dto/create-shipment.dto';
 import { CreateTrackingDto } from './dto/tracking.dto';
-import { ShipmentStatus, NotificationType, ArbiterStatus } from '@prisma/client';
+import { ShipmentDocumentDto } from './dto/shipment-document.dto';
+import { ShipmentStatus, NotificationType, ArbiterStatus, CommentVisibility } from '@prisma/client';
 import { nativeToScVal } from '@stellar/stellar-sdk';
 import { randomUUID } from 'crypto';
 import { parse } from 'csv-parse/sync';
@@ -202,6 +203,7 @@ export class ShipmentsService {
         referenceNumber: dto.referenceNumber,
         metadata: dto.metadata,
         tags: dto.tags ?? [],
+        expectedDeliveryAt: dto.expectedDeliveryAt ? new Date(dto.expectedDeliveryAt) : null,
         milestones: {
           create: milestones.map((m: any, index: number) => ({
             milestoneIndex: index,
@@ -768,6 +770,12 @@ export class ShipmentsService {
     if (dto.referenceNumber !== undefined) updateData.referenceNumber = dto.referenceNumber;
     if (dto.metadata !== undefined) updateData.metadata = dto.metadata;
     if (dto.tags !== undefined) updateData.tags = dto.tags;
+    if (dto.expectedDeliveryAt !== undefined) {
+      if (shipment.status !== ShipmentStatus.ACTIVE) {
+        throw new ConflictException(`Shipment is not ACTIVE (current status: ${shipment.status})`);
+      }
+      updateData.expectedDeliveryAt = dto.expectedDeliveryAt ? new Date(dto.expectedDeliveryAt) : null;
+    }
 
     const updated = await this.conditionalUpdate(shipment, ifMatch, {
       data: updateData,
@@ -819,6 +827,157 @@ export class ShipmentsService {
     }
     const changes = extractChanges(entry.metadata);
     return isAdmin ? changes : changes.filter((c) => !isHiddenField(c.field));
+  }
+
+  /**
+   * GET /shipments/:id/documents
+   * Return every IPFS document linked to a shipment (proofs, dispute evidence, comment attachments)
+   * in one list, filtered by visibility rules and optional source filter, sorted by uploadedAt desc.
+   */
+  async getDocuments(
+    shipmentId: string,
+    callerAddress: string,
+    isAdmin = false,
+    source?: string,
+  ): Promise<ShipmentDocumentDto[]> {
+    const shipment = await this.prisma.shipment.findUnique({
+      where: { id: shipmentId },
+      select: {
+        id: true,
+        buyerAddress: true,
+        supplierAddress: true,
+        logisticsAddress: true,
+        arbiterAddress: true,
+      },
+    });
+
+    if (!shipment) {
+      throw new NotFoundException(`Shipment ${shipmentId} not found`);
+    }
+
+    if (
+      !isAdmin &&
+      callerAddress !== shipment.buyerAddress &&
+      callerAddress !== shipment.supplierAddress &&
+      callerAddress !== shipment.logisticsAddress &&
+      callerAddress !== shipment.arbiterAddress
+    ) {
+      throw new ForbiddenException('Only shipment participants can view shipment documents');
+    }
+
+    // Comment visibility filtering
+    const isBuyerOrSupplier =
+      callerAddress === shipment.buyerAddress || callerAddress === shipment.supplierAddress;
+    const isInternalParty =
+      callerAddress === shipment.logisticsAddress || callerAddress === shipment.arbiterAddress;
+
+    const allowedVisibilities: CommentVisibility[] = [CommentVisibility.ALL];
+    if (isBuyerOrSupplier) allowedVisibilities.push(CommentVisibility.BUYER_SUPPLIER);
+    if (isInternalParty) allowedVisibilities.push(CommentVisibility.INTERNAL);
+    if (isAdmin) {
+      allowedVisibilities.push(CommentVisibility.BUYER_SUPPLIER, CommentVisibility.INTERNAL);
+    }
+
+    const [proofs, evidence, comments] = await Promise.all([
+      this.prisma.proofSubmission.findMany({
+        where: {
+          milestone: {
+            shipmentId,
+            deletedAt: null,
+          },
+        },
+        include: {
+          milestone: {
+            select: { milestoneIndex: true },
+          },
+        },
+      }),
+      this.prisma.disputeEvidence.findMany({
+        where: {
+          milestone: {
+            shipmentId,
+            deletedAt: null,
+          },
+          ipfsCid: { not: null },
+        },
+        include: {
+          milestone: {
+            select: { milestoneIndex: true },
+          },
+        },
+      }),
+      this.prisma.shipmentComment.findMany({
+        where: {
+          shipmentId,
+          deletedAt: null,
+          attachmentCid: { not: null },
+          visibility: { in: allowedVisibilities },
+        },
+        include: {
+          author: {
+            select: { stellarAddress: true },
+          },
+        },
+      }),
+    ]);
+
+    const items: ShipmentDocumentDto[] = [];
+
+    for (const p of proofs) {
+      if (p.ipfsCid) {
+        items.push({
+          source: 'PROOF',
+          cid: p.ipfsCid,
+          uploadedBy: p.submittedBy,
+          uploadedAt: p.createdAt,
+          milestoneIndex: p.milestone?.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${p.ipfsCid}`,
+        });
+      }
+    }
+
+    for (const e of evidence) {
+      if (e.ipfsCid) {
+        items.push({
+          source: 'DISPUTE_EVIDENCE',
+          cid: e.ipfsCid,
+          fileName: e.fileName ?? undefined,
+          mimeType: e.mimeType ?? undefined,
+          uploadedBy: e.submittedBy,
+          uploadedAt: e.createdAt,
+          milestoneIndex: e.milestone?.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${e.ipfsCid}`,
+        });
+      }
+    }
+
+    for (const c of comments) {
+      if (c.attachmentCid) {
+        items.push({
+          source: 'COMMENT',
+          cid: c.attachmentCid,
+          uploadedBy: c.author?.stellarAddress ?? c.authorId,
+          uploadedAt: c.createdAt,
+          milestoneIndex: c.milestoneIndex ?? undefined,
+          downloadUrl: `/api/v1/ipfs/${c.attachmentCid}`,
+        });
+      }
+    }
+
+    let filtered = items;
+    if (source) {
+      const normalized = source.toUpperCase().trim();
+      filtered = filtered.filter((item) => {
+        if (normalized === 'PROOF' || normalized === 'PROOF_SUBMISSION') {
+          return item.source === 'PROOF';
+        }
+        return item.source === normalized;
+      });
+    }
+
+    filtered.sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+
+    return filtered;
   }
 
   async replaceTags(
@@ -1661,7 +1820,7 @@ export class ShipmentsService {
   ) {
     const shipment = await this.prisma.shipment.findUnique({
       where: { id: shipmentId },
-      select: { logisticsAddress: true, buyerAddress: true, supplierAddress: true, id: true },
+      select: { logisticsAddress: true, buyerAddress: true, supplierAddress: true, id: true, expectedDeliveryAt: true },
     });
 
     if (!shipment) {
@@ -1671,6 +1830,11 @@ export class ShipmentsService {
     if (shipment.logisticsAddress !== callerAddress) {
       throw new ForbiddenException('Only the logistics participant can submit tracking updates');
     }
+
+    const latestPriorTracking = await this.prisma.trackingUpdate.findFirst({
+      where: { shipmentId: shipment.id },
+      orderBy: { createdAt: 'desc' },
+    });
 
     const trackingUpdate = await this.prisma.trackingUpdate.create({
       data: {
@@ -1716,6 +1880,41 @@ export class ShipmentsService {
         estimatedArrival: trackingUpdate.estimatedArrival?.toISOString() ?? null,
       },
     );
+
+    // If tracking update has an estimatedArrival later than expectedDeliveryAt, notify buyer and supplier (DELIVERY_DELAYED)
+    if (dto.estimatedArrival && shipment.expectedDeliveryAt) {
+      const newEta = new Date(dto.estimatedArrival);
+      if (newEta > shipment.expectedDeliveryAt) {
+        const priorEtaTime = latestPriorTracking?.estimatedArrival
+          ? new Date(latestPriorTracking.estimatedArrival).getTime()
+          : null;
+        if (newEta.getTime() !== priorEtaTime) {
+          const delayTitle = 'Shipment delivery delayed';
+          const delayMessage = `Delivery for shipment ${shipment.id} is delayed. New ETA: ${newEta.toISOString()} (promised: ${shipment.expectedDeliveryAt.toISOString()}).`;
+          const delayPayload = {
+            shipmentId: shipment.id,
+            expectedDeliveryAt: shipment.expectedDeliveryAt.toISOString(),
+            estimatedArrival: newEta.toISOString(),
+          };
+
+          await this.notifications.notifyUser(
+            shipment.buyerAddress,
+            NotificationType.DELIVERY_DELAYED,
+            delayTitle,
+            delayMessage,
+            delayPayload,
+          );
+
+          await this.notifications.notifyUser(
+            shipment.supplierAddress,
+            NotificationType.DELIVERY_DELAYED,
+            delayTitle,
+            delayMessage,
+            delayPayload,
+          );
+        }
+      }
+    }
 
     this.logger.log(`Tracking update created for shipment ${shipmentId} by ${callerAddress}: ${trackingUpdate.status} at ${trackingUpdate.location}`);
     return trackingUpdate;
@@ -1982,6 +2181,7 @@ export class ShipmentsService {
     const headers = [
       'shipmentId', 'buyerAddress', 'supplierAddress', 'logisticsAddress',
       'arbiterAddress', 'totalAmount', 'releasedAmount', 'status', 'createdAt',
+      'expectedDeliveryAt',
       'milestoneName', 'milestoneIndex', 'paymentPercent', 'milestoneStatus',
       'proofHash', 'confirmedAt',
     ];
@@ -2007,6 +2207,7 @@ export class ShipmentsService {
         toUsdc(s.releasedAmount),
         s.status,
         s.createdAt?.toISOString() ?? '',
+        s.expectedDeliveryAt ? (s.expectedDeliveryAt instanceof Date ? s.expectedDeliveryAt.toISOString() : new Date(s.expectedDeliveryAt).toISOString()) : '',
       ];
 
       if (!s.milestones?.length) {

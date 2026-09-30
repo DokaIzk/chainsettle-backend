@@ -112,6 +112,11 @@ export class CreateShipmentDto {
   @IsString({ each: true })
   tags?: string[];
 
+  @ApiProperty({ required: false, example: '2026-07-01T00:00:00.000Z', description: 'Promised delivery date/time (ISO 8601)' })
+  @IsOptional()
+  @IsISO8601()
+  expectedDeliveryAt?: string;
+
   @ApiProperty({
     required: false,
     example: 2,
@@ -167,6 +172,11 @@ export class UpdateShipmentDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[];
+
+  @ApiProperty({ required: false, example: '2026-07-01T00:00:00.000Z', description: 'Promised delivery date/time (ISO 8601)' })
+  @IsOptional()
+  @IsISO8601()
+  expectedDeliveryAt?: string;
 }
 
 export class BulkStatusDto {

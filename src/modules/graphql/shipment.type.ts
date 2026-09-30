@@ -107,6 +107,9 @@ export class ShipmentGql {
   @Field({ nullable: true })
   referenceNumber?: string;
 
+  @Field({ nullable: true })
+  expectedDeliveryAt?: Date;
+
   @Field()
   createdAt: Date;
 
