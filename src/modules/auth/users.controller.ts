@@ -26,10 +26,74 @@ export class UsersController {
 
   @Get('me')
   @ApiOperation({ summary: 'Get the authenticated user profile' })
-  @ApiResponse({ status: 200, description: 'Returns user profile' })
+  @ApiResponse({ status: 200, description: 'Returns user profile with avatarUrl' })
   @ApiResponse({ status: 401, description: 'Unauthorized' })
   getProfile(@CurrentUser() user: any) {
     return this.authService.getProfile(user.id);
+  }
+
+  @Put('me/avatar')
+  @HttpCode(HttpStatus.OK)
+  @BlockImpersonation()
+  @ApiOperation({
+    summary: 'Upload profile picture via IPFS (max 2 MB, PNG/JPEG/WebP)',
+    description:
+      'Uploads an avatar image to IPFS and updates the authenticated user\'s avatarCid. ' +
+      'Limited to image/png, image/jpeg, and image/webp with a maximum file size of 2 MB.',
+  })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['file'],
+      properties: {
+        file: {
+          type: 'string',
+          format: 'binary',
+          description: 'Profile image file (PNG, JPEG, WebP, max 2 MB)',
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 200, description: 'Avatar uploaded successfully — returns avatarCid and avatarUrl' })
+  @ApiResponse({ status: 400, description: 'No file uploaded or unsupported MIME type' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Blocked during impersonation' })
+  @ApiResponse({ status: 413, description: 'File size exceeds 2 MB limit' })
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: memoryStorage(),
+      limits: { fileSize: 2 * 1024 * 1024 },
+      fileFilter(_req, file, cb) {
+        const allowedMimes = ['image/png', 'image/jpeg', 'image/webp'];
+        if (!allowedMimes.includes(file.mimetype)) {
+          return cb(
+            new BadRequestException(
+              `Invalid file type: ${file.mimetype}. Allowed types: ${allowedMimes.join(', ')}`,
+            ),
+            false,
+          );
+        }
+        cb(null, true);
+      },
+    }),
+  )
+  uploadAvatar(
+    @CurrentUser('id') userId: string,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    return this.authService.uploadAvatar(userId, file);
+  }
+
+  @Delete('me/avatar')
+  @HttpCode(HttpStatus.OK)
+  @BlockImpersonation()
+  @ApiOperation({ summary: 'Delete user profile avatar' })
+  @ApiResponse({ status: 200, description: 'Avatar deleted successfully' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Blocked during impersonation' })
+  deleteAvatar(@CurrentUser('id') userId: string) {
+    return this.authService.deleteAvatar(userId);
   }
 
   @Get('me/sessions')
@@ -176,3 +240,4 @@ export class UsersController {
     return this.authService.getPublicProfile(stellarAddress);
   }
 }
+

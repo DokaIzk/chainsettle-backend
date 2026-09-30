@@ -40,6 +40,7 @@ These require a valid JWT **and** `user.role === ADMIN`. Every row below is enfo
 | `GET` | `/users/admin/:id` | Get any user by id |
 | `PATCH` | `/users/admin/:id/role` | Change a user's role *(manually enforced — see [Caveats](#3-caveats--known-inconsistencies))* |
 | `POST` | `/admin/users/:id/impersonate` | Start an impersonation session for a user |
+| `POST` | `/admin/users/:id/force-logout` | Force logout a user everywhere (revoking all sessions and optionally API keys) |
 | `POST` | `/admin/webhooks/:id/deliveries/replay` | Bulk-replay failed webhook deliveries in a date range (#308) |
 
 `ADMIN` also **bypasses** `ShipmentParticipantGuard` everywhere it's used (see §2) — an admin can read any shipment's detail, milestones, tracking, etc. without being a participant. It does **not** bypass the buyer/supplier/logistics/arbiter-only *mutation* checks below (e.g. `PATCH /shipments/:id`) — those compare the caller's address directly to the shipment record and have no admin override, so an admin must use the dedicated `/admin/*` routes for actions like force-sync instead.
@@ -101,7 +102,7 @@ Notes:
 
 ## 2c. Self-scoped endpoints (any authenticated user, own data only)
 
-`GET/PATCH /users/me*`, `DELETE /users/me`, device-token endpoints, `GET /users/:stellarAddress` (any user's public profile), API key create/delete (delete is owner-only), notification list/read/preferences, saved shipment filters, KYC initiate/status/withdraw, calendar-token minting — all scoped by `@CurrentUser('id')`/`@CurrentUser('stellarAddress')` passed into the service layer, not by role.
+`GET/PATCH /users/me*`, `PUT/DELETE /users/me/avatar`, `DELETE /users/me`, device-token endpoints, `GET /users/:stellarAddress` (any user's public profile), API key create/delete (delete is owner-only), notification list/read/preferences, saved shipment filters, KYC initiate/status/withdraw, calendar-token minting — all scoped by `@CurrentUser('id')`/`@CurrentUser('stellarAddress')` passed into the service layer, not by role.
 
 ## 2d. Any-authenticated-user endpoints (no ownership or role restriction)
 

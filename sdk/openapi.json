@@ -281,6 +281,58 @@
         }
       }
     },
+    "/api/v1/admin/users/{id}/force-logout": {
+      "post": {
+        "tags": ["admin"],
+        "operationId": "AdminUsersController_forceLogout",
+        "summary": "Force logout a user everywhere",
+        "security": [{ "bearer": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "required": true,
+            "in": "path",
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "revokeApiKeys": { "type": "boolean", "default": false }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "User force-logged out successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": { "type": "boolean" },
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "message": { "type": "string" },
+                        "revokedSessionsCount": { "type": "number" },
+                        "revokedApiKeysCount": { "type": "number" }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/users/me": {
       "get": {
         "tags": ["users"],
@@ -296,6 +348,98 @@
               }
             }
           }
+        }
+      }
+    },
+    "/api/v1/users/me/avatar": {
+      "put": {
+        "tags": ["users"],
+        "operationId": "UsersController_uploadAvatar",
+        "summary": "Upload profile picture via IPFS",
+        "security": [{ "bearer": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Avatar uploaded successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string" },
+                    "avatarCid": { "type": "string" },
+                    "avatarUrl": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "No file uploaded or unsupported MIME type" },
+          "413": { "description": "File size exceeds 2 MB limit" }
+        }
+      },
+      "delete": {
+        "tags": ["users"],
+        "operationId": "UsersController_deleteAvatar",
+        "summary": "Delete user profile avatar",
+        "security": [{ "bearer": [] }],
+        "responses": {
+          "200": {
+            "description": "Avatar deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{stellarAddress}": {
+      "get": {
+        "tags": ["users"],
+        "operationId": "UsersController_getPublicProfile",
+        "summary": "Get a public user profile by Stellar address",
+        "security": [{ "bearer": [] }],
+        "parameters": [
+          {
+            "name": "stellarAddress",
+            "required": true,
+            "in": "path",
+            "schema": { "type": "string" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Public user profile returned",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Envelope" }
+              }
+            }
+          },
+          "404": { "description": "User not found" }
         }
       }
     }
