@@ -2,7 +2,7 @@
 
 Thanks for contributing! This guide covers the contributor workflow — setup, branching,
 commits, tests, and PR expectations. For architecture, module overview, and API details,
-see [README.md](README.md).
+see [README.md](README.md). If you run into setup or runtime errors, see [docs/troubleshooting.md](docs/troubleshooting.md).
 
 ---
 

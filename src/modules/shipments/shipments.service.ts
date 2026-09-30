@@ -1766,20 +1766,20 @@ export class ShipmentsService {
         logisticsAddress: true,
         arbiterAddress: true,
         arbiterStatus: true,
-        buyer: { select: { name: true } },
-        supplier: { select: { name: true } },
-        logistics: { select: { name: true } },
-        arbiter: { select: { name: true } },
+        buyer: { select: { name: true, organizationName: true, countryCode: true } },
+        supplier: { select: { name: true, organizationName: true, countryCode: true } },
+        logistics: { select: { name: true, organizationName: true, countryCode: true } },
+        arbiter: { select: { name: true, organizationName: true, countryCode: true } },
       },
     });
 
     if (!shipment) throw new NotFoundException(`Shipment ${shipmentId} not found`);
 
     return [
-      { role: 'BUYER', stellarAddress: shipment.buyerAddress, name: shipment.buyer.name ?? null },
-      { role: 'SUPPLIER', stellarAddress: shipment.supplierAddress, name: shipment.supplier.name ?? null },
-      { role: 'LOGISTICS', stellarAddress: shipment.logisticsAddress, name: shipment.logistics.name ?? null },
-      { role: 'ARBITER', stellarAddress: shipment.arbiterAddress, name: shipment.arbiter.name ?? null, arbiterStatus: shipment.arbiterStatus },
+      { role: 'BUYER', stellarAddress: shipment.buyerAddress, name: shipment.buyer.name ?? null, organizationName: shipment.buyer.organizationName ?? null, countryCode: shipment.buyer.countryCode ?? null },
+      { role: 'SUPPLIER', stellarAddress: shipment.supplierAddress, name: shipment.supplier.name ?? null, organizationName: shipment.supplier.organizationName ?? null, countryCode: shipment.supplier.countryCode ?? null },
+      { role: 'LOGISTICS', stellarAddress: shipment.logisticsAddress, name: shipment.logistics.name ?? null, organizationName: shipment.logistics.organizationName ?? null, countryCode: shipment.logistics.countryCode ?? null },
+      { role: 'ARBITER', stellarAddress: shipment.arbiterAddress, name: shipment.arbiter.name ?? null, organizationName: shipment.arbiter.organizationName ?? null, countryCode: shipment.arbiter.countryCode ?? null, arbiterStatus: shipment.arbiterStatus },
     ];
   }
 
@@ -1963,9 +1963,17 @@ export class ShipmentsService {
       ];
     }
 
+    const userSelect = { select: { name: true, organizationName: true } };
+
     return this.prisma.shipment.findMany({
       where,
-      include: { milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } } },
+      include: {
+        milestones: { where: { deletedAt: null }, orderBy: { milestoneIndex: 'asc' } },
+        buyer:     userSelect,
+        supplier:  userSelect,
+        logistics: userSelect,
+        arbiter:   userSelect,
+      },
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -2040,13 +2048,16 @@ export class ShipmentsService {
         doc.fontSize(9);
 
         const participants = [
-          ['Buyer', s.buyerAddress],
-          ['Supplier', s.supplierAddress],
-          ['Logistics', s.logisticsAddress],
-          ['Arbiter', s.arbiterAddress],
+          ['Buyer',     s.buyerAddress,     s.buyer],
+          ['Supplier',  s.supplierAddress,  s.supplier],
+          ['Logistics', s.logisticsAddress, s.logistics],
+          ['Arbiter',   s.arbiterAddress,   s.arbiter],
         ];
-        for (const [role, addr] of participants) {
-          doc.text(`${role}: ${addr}`);
+        for (const [role, addr, user] of participants) {
+          const label = user?.organizationName
+            ? `${role}: ${addr} (${user.organizationName})`
+            : `${role}: ${addr}`;
+          doc.text(label);
         }
 
         doc.moveDown(0.5);
@@ -2084,6 +2095,10 @@ export class ShipmentsService {
         },
         events: { orderBy: { ledger: 'desc' }, take: 50 },
         comments: { where: { visibility: 'ALL' }, orderBy: { createdAt: 'asc' } },
+        buyer:     { select: { name: true, organizationName: true } },
+        supplier:  { select: { name: true, organizationName: true } },
+        logistics: { select: { name: true, organizationName: true } },
+        arbiter:   { select: { name: true, organizationName: true } },
       },
     });
     if (!shipment) throw new NotFoundException(`Shipment ${id} not found`);
@@ -2109,13 +2124,16 @@ export class ShipmentsService {
       doc.fontSize(9);
 
       const participants = [
-        ['Buyer', shipment.buyerAddress],
-        ['Supplier', shipment.supplierAddress],
-        ['Logistics', shipment.logisticsAddress],
-        ['Arbiter', shipment.arbiterAddress],
+        ['Buyer',     shipment.buyerAddress,     shipment.buyer],
+        ['Supplier',  shipment.supplierAddress,  shipment.supplier],
+        ['Logistics', shipment.logisticsAddress, shipment.logistics],
+        ['Arbiter',   shipment.arbiterAddress,   shipment.arbiter],
       ];
-      for (const [role, addr] of participants) {
-        doc.text(`${role}: ${addr}`);
+      for (const [role, addr, user] of participants) {
+        const label = (user as any)?.organizationName
+          ? `${role}: ${addr} (${(user as any).organizationName})`
+          : `${role}: ${addr}`;
+        doc.text(label);
       }
 
       doc.moveDown(0.5);
