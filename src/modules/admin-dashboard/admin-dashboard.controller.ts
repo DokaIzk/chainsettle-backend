@@ -4,20 +4,24 @@ import {
   Logger,
   UseGuards,
   Sse,
+  Query,
+  Res,
   MessageEvent,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import { UserRole } from '@prisma/client';
 import { Observable } from 'rxjs';
+import { Response } from 'express';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { AdminDashboardService } from './admin-dashboard.service';
+import { VolumeReportQueryDto } from './dto/volume-report-query.dto';
 
 @ApiTags('admin')
 @ApiBearerAuth()
 @UseGuards(JwtAuthGuard)
-@Controller('admin/dashboard')
+@Controller('admin')
 export class AdminDashboardController {
   private readonly logger = new Logger(AdminDashboardController.name);
 
@@ -35,7 +39,7 @@ export class AdminDashboardController {
    * Closing the connection cleans up the server-side interval automatically
    * (the Observable subscription is torn down by NestJS when the response closes).
    */
-  @Get('realtime')
+  @Get('dashboard/realtime')
   @Roles(UserRole.ADMIN)
   @Sse()
   @ApiOperation({
@@ -74,5 +78,30 @@ export class AdminDashboardController {
         this.logger.debug('SSE client disconnected — interval cleared');
       };
     });
+  }
+
+  /**
+   * GET /api/v1/admin/reports/volume
+   *
+   * Shipment volume time series report grouped by interval.
+   */
+  @Get('reports/volume')
+  @Roles(UserRole.ADMIN)
+  @ApiOperation({ summary: '[Admin] Shipment volume time-series report' })
+  @ApiResponse({ status: 200, description: 'Time-series volume report (JSON or CSV)' })
+  @ApiResponse({ status: 400, description: 'Invalid date range or parameter' })
+  @ApiResponse({ status: 401, description: 'Unauthorized' })
+  @ApiResponse({ status: 403, description: 'Admin access required' })
+  async getVolumeReport(
+    @Query() query: VolumeReportQueryDto,
+    @Res() res: Response,
+  ) {
+    const result = await this.dashboard.getVolumeReport(query);
+    if (query.format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', 'attachment; filename="shipment-volume-report.csv"');
+      return res.send(result);
+    }
+    return res.json(result);
   }
 }

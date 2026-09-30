@@ -1,6 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, BadRequestException } from '@nestjs/common';
 import { PrismaService } from '../../common/prisma/prisma.service';
 import { RedisService } from '../../common/redis/redis.service';
+import { TokenRegistryService } from '../../common/token-registry/token-registry.service';
+import { FxRateService } from '../../common/fx/fx-rate.service';
+import { VolumeReportQueryDto } from './dto/volume-report-query.dto';
+import { buildCsvFromRows } from '../../common/utils/csv.util';
 
 export interface DashboardSnapshot {
   /** ISO-8601 timestamp of when this snapshot was taken */
@@ -14,11 +18,15 @@ export interface DashboardSnapshot {
   eventPollerLag: number | null;
 }
 
-/**
- * Aggregates live platform metrics for the admin dashboard.
- * The same snapshot is used both by the SSE stream (GET /admin/dashboard/realtime)
- * and, in future, by a point-in-time GET /admin/stats endpoint.
- */
+export interface VolumeBucket {
+  periodStart: string;
+  shipmentsCreated: number;
+  shipmentsCompleted: number;
+  totalValue: string;
+  totalValueUsd: number;
+  releasedValue: string;
+}
+
 @Injectable()
 export class AdminDashboardService {
   private readonly logger = new Logger(AdminDashboardService.name);
@@ -26,6 +34,8 @@ export class AdminDashboardService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
+    private readonly tokenRegistry: TokenRegistryService,
+    private readonly fxRate: FxRateService,
   ) {}
 
   async getSnapshot(): Promise<DashboardSnapshot> {
@@ -68,5 +78,185 @@ export class AdminDashboardService {
       eventPollerLedger,
       eventPollerLag,
     };
+  }
+
+  async getVolumeReport(query: VolumeReportQueryDto): Promise<VolumeBucket[] | string> {
+    const interval = query.interval || 'day';
+    const now = new Date();
+    
+    let toDate = query.to ? new Date(query.to) : now;
+    if (isNaN(toDate.getTime())) {
+      throw new BadRequestException('Invalid "to" date parameter');
+    }
+
+    let fromDate: Date;
+    if (query.from) {
+      fromDate = new Date(query.from);
+      if (isNaN(fromDate.getTime())) {
+        throw new BadRequestException('Invalid "from" date parameter');
+      }
+    } else {
+      fromDate = new Date(toDate);
+      fromDate.setMonth(fromDate.getMonth() - 1);
+    }
+
+    if (fromDate > toDate) {
+      throw new BadRequestException('"from" date must be before or equal to "to" date');
+    }
+
+    // Enforce 2 years max range
+    const maxMs = 2 * 365 * 24 * 60 * 60 * 1000;
+    if (toDate.getTime() - fromDate.getTime() > maxMs) {
+      throw new BadRequestException('Date range cannot exceed 2 years');
+    }
+
+    // Cache key for 10 minutes cache
+    const cacheKey = `admin:reports:volume:${fromDate.toISOString()}:${toDate.toISOString()}:${interval}:${query.token || 'all'}:${query.format || 'json'}`;
+    const cached = await this.redis.get(cacheKey);
+    if (cached) {
+      if (query.format === 'csv') {
+        return cached;
+      }
+      try {
+        return JSON.parse(cached);
+      } catch {
+        // Fallthrough if cache parse fails
+      }
+    }
+
+    // Resolve token decimals and symbol if token filter is provided
+    let tokenAddressFilter: string | undefined = undefined;
+    let tokenDecimals = 7;
+    let tokenSymbol = 'USDC';
+
+    if (query.token) {
+      const entry = this.tokenRegistry.findByAddress(query.token) ||
+        this.tokenRegistry.listTokens().find(t => t.symbol.toUpperCase() === query.token?.toUpperCase());
+      if (entry) {
+        tokenAddressFilter = entry.address;
+        tokenDecimals = entry.decimals;
+        tokenSymbol = entry.symbol;
+      } else {
+        tokenSymbol = query.token.toUpperCase();
+      }
+    }
+
+    // Get exchange rate for token to USD
+    const rateEntry = await this.fxRate.getUsdRate(tokenSymbol);
+    const usdRate = rateEntry?.rate ?? 1.0;
+
+    // Build raw SQL query using date_trunc
+    const dateTruncUnit = interval; // 'day', 'week', 'month'
+    
+    // We select created shipments and completed shipments aggregated by bucket
+    // Note: totalAmount and releasedAmount are BigInt stroops in DB
+    const rawCreated: Array<{
+      period_start: Date;
+      shipments_created: bigint | number;
+      total_value: bigint | number;
+      released_value: bigint | number;
+    }> = await this.prisma.$queryRawUnsafe(`
+      SELECT 
+        date_trunc('${dateTruncUnit}', "createdAt") AS period_start,
+        COUNT(*)::bigint AS shipments_created,
+        COALESCE(SUM("totalAmount"), 0)::bigint AS total_value,
+        COALESCE(SUM("releasedAmount"), 0)::bigint AS released_value
+      FROM shipments
+      WHERE "createdAt" >= $1 AND "createdAt" <= $2
+        ${tokenAddressFilter ? `AND UPPER("tokenAddress") = UPPER('${tokenAddressFilter}')` : ''}
+      GROUP BY period_start
+      ORDER BY period_start ASC
+    `, fromDate, toDate);
+
+    const rawCompleted: Array<{
+      period_start: Date;
+      shipments_completed: bigint | number;
+    }> = await this.prisma.$queryRawUnsafe(`
+      SELECT 
+        date_trunc('${dateTruncUnit}', "updatedAt") AS period_start,
+        COUNT(*)::bigint AS shipments_completed
+      FROM shipments
+      WHERE status = 'COMPLETED' AND "updatedAt" >= $1 AND "updatedAt" <= $2
+        ${tokenAddressFilter ? `AND UPPER("tokenAddress") = UPPER('${tokenAddressFilter}')` : ''}
+      GROUP BY period_start
+      ORDER BY period_start ASC
+    `, fromDate, toDate);
+
+    const createdMap = new Map<string, { count: number; totalValue: bigint; releasedValue: bigint }>();
+    for (const row of rawCreated) {
+      const key = new Date(row.period_start).toISOString();
+      createdMap.set(key, {
+        count: Number(row.shipments_created),
+        totalValue: BigInt(row.total_value.toString()),
+        releasedValue: BigInt(row.released_value.toString()),
+      });
+    }
+
+    const completedMap = new Map<string, number>();
+    for (const row of rawCompleted) {
+      const key = new Date(row.period_start).toISOString();
+      completedMap.set(key, Number(row.shipments_completed));
+    }
+
+    // Generate continuous time series buckets (filling empty periods with zeros)
+    const buckets: VolumeBucket[] = [];
+    let curr = new Date(fromDate);
+    
+    // Align curr to period start
+    if (interval === 'day') {
+      curr.setUTCHours(0, 0, 0, 0);
+    } else if (interval === 'week') {
+      curr.setUTCHours(0, 0, 0, 0);
+      const day = curr.getUTCDay();
+      const diff = curr.getUTCDate() - day + (day === 0 ? -6 : 1); // Monday start
+      curr.setUTCDate(diff);
+    } else if (interval === 'month') {
+      curr.setUTCHours(0, 0, 0, 0);
+      curr.setUTCDate(1);
+    }
+
+    while (curr <= toDate) {
+      const periodIso = curr.toISOString();
+      const createdData = createdMap.get(periodIso) || { count: 0, totalValue: BigInt(0), releasedValue: BigInt(0) };
+      const completedCount = completedMap.get(periodIso) || 0;
+
+      const totalValHuman = Number(createdData.totalValue) / (10 ** tokenDecimals);
+      const releasedValHuman = Number(createdData.releasedValue) / (10 ** tokenDecimals);
+      const totalValueUsd = Math.round((totalValHuman * usdRate) * 100) / 100;
+
+      buckets.push({
+        periodStart: periodIso,
+        shipmentsCreated: createdData.count,
+        shipmentsCompleted: completedCount,
+        totalValue: totalValHuman.toFixed(tokenDecimals),
+        totalValueUsd,
+        releasedValue: releasedValHuman.toFixed(tokenDecimals),
+      });
+
+      // Increment curr
+      if (interval === 'day') {
+        curr.setUTCDate(curr.getUTCDate() + 1);
+      } else if (interval === 'week') {
+        curr.setUTCDate(curr.getUTCDate() + 7);
+      } else if (interval === 'month') {
+        curr.setUTCMonth(curr.getUTCMonth() + 1);
+      }
+    }
+
+    if (query.format === 'csv') {
+      const csvStr = buildCsvFromRows(buckets.map(b => ({
+        periodStart: b.periodStart,
+        shipmentsCreated: b.shipmentsCreated,
+        shipmentsCompleted: b.shipmentsCompleted,
+        totalValue: b.totalValue,
+        totalValueUsd: b.totalValueUsd,
+        releasedValue: b.releasedValue,
+      })));
+      await this.redis.set(cacheKey, csvStr, 600); // 10 minutes cache
+      return csvStr;
+    }
+
+    await this.redis.set(cacheKey, JSON.stringify(buckets), 600); // 10 minutes cache
+    return buckets;
   }
 }
