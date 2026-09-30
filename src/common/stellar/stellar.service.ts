@@ -1,4 +1,4 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy, OnModuleInit, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import {
   Networks,
@@ -14,6 +14,8 @@ import {
 } from '@stellar/stellar-sdk';
 import { SpanKind } from '@opentelemetry/api';
 import { withSpan } from '../tracing/trace.helper';
+import { MetricsService } from '../metrics/metrics.service';
+import { RpcPool, parseUrlList } from './rpc-pool';
 
 /**
  * StellarService
@@ -30,32 +32,100 @@ import { withSpan } from '../tracing/trace.helper';
  * by the user's wallet (Freighter) in the frontend.
  */
 @Injectable()
-export class StellarService implements OnModuleInit {
+export class StellarService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(StellarService.name);
 
-  private rpcClient: SorobanRpc.Server;
-   private horizonClient: Horizon.Server;
+  private rpcPool: RpcPool<SorobanRpc.Server>;
+  private horizonPool: RpcPool<Horizon.Server>;
+  private healthTimer?: NodeJS.Timeout;
   private network: string;
   private networkPassphrase: string;
   private contractId: string;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(
+    private readonly config: ConfigService,
+    @Optional() private readonly metrics?: MetricsService,
+  ) {}
 
-onModuleInit() {
-    const rpcUrl = this.config.get<string>('STELLAR_RPC_URL');
-    const horizonUrl = this.config.get<string>('STELLAR_HORIZON_URL');
+  /** Active (failover-aware) Soroban RPC client. */
+  private get rpcClient(): SorobanRpc.Server {
+    return this.rpcPool.proxy;
+  }
+
+  /** Active (failover-aware) Horizon client. */
+  private get horizonClient(): Horizon.Server {
+    return this.horizonPool.proxy;
+  }
+
+  onModuleInit() {
+    const rpcUrls = parseUrlList(
+      this.config.get<string>('STELLAR_RPC_URLS'),
+      this.config.get<string>('STELLAR_RPC_URL'),
+    );
+    const horizonUrls = parseUrlList(
+      this.config.get<string>('STELLAR_HORIZON_URLS'),
+      this.config.get<string>('STELLAR_HORIZON_URL'),
+    );
     const networkName = this.config.get<string>('STELLAR_NETWORK', 'testnet');
 
-    this.rpcClient = new SorobanRpc.Server(rpcUrl, { allowHttp: true });
-    this.horizonClient = new Horizon.Server(horizonUrl, { allowHttp: true });
     this.contractId = this.config.get<string>('CHAINSETTTLE_CONTRACT_ID');
-
     this.networkPassphrase =
       networkName === 'mainnet' ? Networks.PUBLIC : Networks.TESTNET;
 
-    this.logger.log(`Stellar connected to ${networkName} (${rpcUrl})`);
-    this.logger.log(`Horizon connected at ${horizonUrl}`);
+    const passphrase = this.networkPassphrase;
+    this.rpcPool = new RpcPool(rpcUrls, (url) => new SorobanRpc.Server(url, { allowHttp: true }), {
+      name: 'rpc',
+      probe: async (client, url) => {
+        const network = await client.getNetwork();
+        if (network.passphrase !== passphrase) {
+          throw new Error(`Network passphrase mismatch for ${url}`);
+        }
+        return (await client.getLatestLedger()).sequence;
+      },
+    });
+    this.horizonPool = new RpcPool(horizonUrls, (url) => new Horizon.Server(url, { allowHttp: true }), {
+      name: 'horizon',
+      probe: async (_client, url) => {
+        const res = await fetch(url);
+        if (!res.ok) throw Object.assign(new Error(`Horizon returned ${res.status}`), { status: res.status });
+        const root: any = await res.json();
+        if (root.network_passphrase !== passphrase) {
+          throw new Error(`Network passphrase mismatch for ${url}`);
+        }
+        return Number(root.history_latest_ledger ?? root.core_latest_ledger ?? 0);
+      },
+    });
+
+    const intervalMs = Number(this.config.get('STELLAR_HEALTH_INTERVAL_MS', 15_000));
+    void this.refreshEndpointHealth();
+    this.healthTimer = setInterval(() => void this.refreshEndpointHealth(), intervalMs);
+    this.healthTimer.unref?.();
+
+    this.logger.log(`Stellar connected to ${networkName} (${rpcUrls.join(', ')})`);
+    this.logger.log(`Horizon connected at ${horizonUrls.join(', ')}`);
     this.logger.log(`Contract ID: ${this.contractId}`);
+  }
+
+  onModuleDestroy() {
+    if (this.healthTimer) clearInterval(this.healthTimer);
+  }
+
+  /** Probes all RPC/Horizon endpoints and publishes their health as metrics. */
+  async refreshEndpointHealth(): Promise<void> {
+    await Promise.all([this.rpcPool.healthCheck(), this.horizonPool.healthCheck()]);
+    for (const [type, pool] of [['rpc', this.rpcPool], ['horizon', this.horizonPool]] as const) {
+      for (const ep of pool.status()) {
+        this.metrics?.setStellarEndpointHealth(type, ep.url, ep.healthy, ep.active);
+      }
+    }
+  }
+
+  /** Active endpoint and per-endpoint health for GET /health/detailed. */
+  getEndpointHealth() {
+    return {
+      rpc: { active: this.rpcPool.activeUrl, endpoints: this.rpcPool.status() },
+      horizon: { active: this.horizonPool.activeUrl, endpoints: this.horizonPool.status() },
+    };
   }
 
   // ----------------------------------------------------------
@@ -124,7 +194,7 @@ onModuleInit() {
           return [];
         }
       },
-      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      { 'stellar.rpc_url': this.rpcPool.activeUrl },
       SpanKind.CLIENT,
     );
   }
@@ -182,7 +252,7 @@ onModuleInit() {
           throw error;
         }
       },
-      { 'stellar.rpc_url': this.config.get<string>('STELLAR_RPC_URL', '') },
+      { 'stellar.rpc_url': this.rpcPool.activeUrl },
       SpanKind.CLIENT,
     );
   }

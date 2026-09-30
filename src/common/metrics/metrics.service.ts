@@ -6,6 +6,7 @@ export const EVENTS_PROCESSED_COUNTER = 'chainsettle_events_processed_total';
 export const EVENTS_FAILED_COUNTER = 'chainsettle_events_failed_total';
 export const SHIPMENTS_CREATED_COUNTER = 'chainsettle_shipments_created_total';
 export const ACTIVE_SHIPMENTS_GAUGE = 'chainsettle_active_shipments';
+export const STELLAR_ENDPOINT_GAUGE = 'chainsettle_stellar_endpoint_healthy';
 
 @Injectable()
 export class MetricsService {
@@ -18,7 +19,15 @@ export class MetricsService {
     private readonly shipmentsCreated: Counter<string>,
     @InjectMetric(ACTIVE_SHIPMENTS_GAUGE)
     private readonly activeShipments: Gauge<string>,
+    @InjectMetric(STELLAR_ENDPOINT_GAUGE)
+    private readonly stellarEndpoint: Gauge<string>,
   ) {}
+
+  /** 1 = healthy, 0 = unhealthy; `active` label marks the endpoint currently in use. */
+  setStellarEndpointHealth(type: string, url: string, healthy: boolean, active: boolean): void {
+    this.stellarEndpoint.set({ type, url, active: String(active) }, healthy ? 1 : 0);
+    this.stellarEndpoint.remove({ type, url, active: String(!active) });
+  }
 
   incrementEventsProcessed(eventName: string): void {
     this.eventsProcessed.inc({ eventName });

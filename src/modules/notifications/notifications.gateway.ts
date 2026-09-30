@@ -163,6 +163,11 @@ export class NotificationsGateway implements OnGatewayConnection, OnGatewayDisco
     this.logger.debug(`[WS] Pushed notification ${notification.id} to room ${room}`);
   }
 
+  /** Emits an arbitrary event to every socket of a user (e.g. `chain:tx` status updates). */
+  pushEvent(userId: string, event: string, payload: Record<string, any>) {
+    this.server?.to(this.userRoom(userId)).emit(event, payload);
+  }
+
   // ─── Helpers ──────────────────────────────────────────────────────────────
 
   private userRoom(userId: string): string {

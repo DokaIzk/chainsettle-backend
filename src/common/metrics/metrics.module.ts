@@ -7,6 +7,7 @@ import {
   EVENTS_FAILED_COUNTER,
   SHIPMENTS_CREATED_COUNTER,
   ACTIVE_SHIPMENTS_GAUGE,
+  STELLAR_ENDPOINT_GAUGE,
 } from './metrics.service';
 
 @Global()
@@ -34,6 +35,11 @@ import {
     makeGaugeProvider({
       name: ACTIVE_SHIPMENTS_GAUGE,
       help: 'Current number of active shipments',
+    }),
+    makeGaugeProvider({
+      name: STELLAR_ENDPOINT_GAUGE,
+      help: 'Stellar RPC/Horizon endpoint health (1 = healthy); active="true" marks the endpoint in use',
+      labelNames: ['type', 'url', 'active'],
     }),
     MetricsService,
   ],

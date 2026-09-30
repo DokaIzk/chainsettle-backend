@@ -116,6 +116,8 @@ model User {
   notificationPreference NotificationPreference?
   shipmentWatchers ShipmentWatcher[] @relation("ShipmentWatchers")
   shipmentFavorites ShipmentFavorite[] @relation("ShipmentFavorites")
+  sentInvitations     ShipmentInvitation[] @relation("SentInvitations")
+  acceptedInvitations ShipmentInvitation[] @relation("AcceptedInvitations")
   savedFilters      SavedFilter[]      @relation("SavedFilters")
 
   @@map("users")
@@ -574,4 +576,25 @@ model ArchivedShipment {
   @@index([archivedAt])
   @@index([terminalAt])
   @@map("archived_shipments")
+}
+/// Invitation for a counterparty who has no account yet (#379).
+/// Only the SHA-256 hash of the single-use token is stored.
+model ShipmentInvitation {
+  id           String    @id @default(uuid())
+  shipmentId   String?
+  templateId   String?
+  email        String
+  role         UserRole
+  tokenHash    String    @unique
+  invitedById  String
+  acceptedById String?
+  acceptedAt   DateTime?
+  expiresAt    DateTime
+  createdAt    DateTime  @default(now())
+
+  invitedBy  User  @relation("SentInvitations", fields: [invitedById], references: [id], onDelete: Cascade)
+  acceptedBy User? @relation("AcceptedInvitations", fields: [acceptedById], references: [id])
+
+  @@index([invitedById, createdAt])
+  @@map("shipment_invitations")
 }

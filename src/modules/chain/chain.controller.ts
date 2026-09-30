@@ -1,6 +1,10 @@
 import {
   Controller,
   Get,
+  Post,
+  Body,
+  HttpCode,
+  HttpStatus,
   Param,
   ParseIntPipe,
   BadRequestException,
@@ -14,6 +18,10 @@ import { RedisService } from '../../common/redis/redis.service';
 import { Throttle } from '@nestjs/throttler';
 import { AddressParamDto } from './dto/address-param.dto';
 import { Public } from '../../common/decorators/public.decorator';
+import { CurrentUser } from '../../common/decorators/current-user.decorator';
+import { StellarAddressThrottlerGuard } from '../../common/guards/stellar-address-throttler.guard';
+import { SubmitTransactionDto } from './dto/submit-transaction.dto';
+import { TransactionRelayService } from './transaction-relay.service';
 
 @ApiTags('chain')
 @ApiBearerAuth()
@@ -23,7 +31,22 @@ export class ChainController {
   constructor(
     private readonly stellar: StellarService,
     private readonly redis: RedisService,
+    private readonly relay: TransactionRelayService,
   ) {}
+
+  /**
+   * POST /chain/submit
+   * Relays a client-signed transaction; the final status is pushed over
+   * WebSocket as a `chain:tx` event.
+   */
+  @Post('submit')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @UseGuards(StellarAddressThrottlerGuard)
+  @Throttle({ default: { limit: 10, ttl: 60_000 } })
+  @ApiOperation({ summary: 'Relay a signed transaction and track its status' })
+  submit(@Body() dto: SubmitTransactionDto, @CurrentUser() user: any) {
+    return this.relay.submit(dto.signedXdr, user);
+  }
 
   @Get('ledger/:number')
   @ApiOperation({ summary: 'Look up Stellar ledger metadata by sequence number' })

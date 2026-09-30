@@ -33,6 +33,7 @@ import { ChainModule } from './modules/chain/chain.module';
 import { KycModule } from './modules/kyc/kyc.module';
 import { ArbitersModule } from './modules/arbiters/arbiters.module';
 import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module';
+import { InvitationsModule } from './modules/invitations/invitations.module';
 
 @Module({
   imports: [
@@ -88,6 +89,7 @@ import { FeatureFlagsModule } from './modules/feature-flags/feature-flags.module
     ChainModule,
     KycModule,
     ArbitersModule,
+    InvitationsModule,
     FeatureFlagsModule,
   ],
   providers: [
